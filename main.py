@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from aiogram import Bot, Dispatcher, types, Router, F
-from aiogram.webhook.integrations.fastapi import FastAPIWebhookRequestHandler
+from aiogram.types import Update
 import httpx
 
 # ====== CONFIG ======
@@ -33,10 +33,6 @@ async def astro_run(payload: dict) -> dict:
         return r.json()
 
 def parse_datetime_city_country(text: str):
-    """
-    Формат: 'ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна'
-    Возврат dict: datetime_local ISO + city, country
-    """
     m = DATE_RE.match(text or "")
     if not m:
         return None
@@ -55,7 +51,7 @@ def fmt_usage() -> str:
         "  B: `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
     )
 
-# ====== PDF (минимальный отчёт, кириллица без доп. шрифтов может выглядеть проще) ======
+# ====== PDF ======
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -71,7 +67,6 @@ def init_styles():
     global STYLES
     if STYLES: return
     styles = getSampleStyleSheet()
-    # Без внешних ttf: Helvetica (может быть без кириллицы на некоторых платформах).
     styles.add(ParagraphStyle(name="H1", fontName="Helvetica", fontSize=16, leading=20, spaceAfter=8))
     styles.add(ParagraphStyle(name="H2", fontName="Helvetica", fontSize=13, leading=16, spaceAfter=6))
     styles.add(ParagraphStyle(name="P",  fontName="Helvetica", fontSize=10, leading=14))
@@ -147,7 +142,6 @@ async def cmd_natal(m: types.Message):
     try:
         data = await astro_run(body)
         await m.answer(data.get("text", "Готово."))
-        # PDF
         fname = f"astro_natal_{uuid.uuid4().hex[:8]}.pdf"
         pdf_path = build_pdf("natal", data.get("payload", {}), Path("/tmp")/fname)
         from aiogram.types import FSInputFile
@@ -197,11 +191,14 @@ async def cmd_synastry(m: types.Message):
 app = FastAPI(title="Astro TG Bot")
 
 @app.get("/health")
-def health(): return {"ok": True}
+def health(): 
+    return {"ok": True}
 
-# Webhook handler
-handler = FastAPIWebhookRequestHandler(dispatcher=dp, bot=bot)
-app.post(WEBHOOK_PATH)(handler.handle)
+# Принимаем вебхук напрямую и кормим апдейт диспетчеру
+@app.post(os.getenv("WEBHOOK_PATH", "/tg/webhook"))
+async def telegram_webhook(update: dict):
+    await dp.feed_update(bot, Update.model_validate(update))
+    return {"ok": True}
 
 @app.get("/setup", response_class=PlainTextResponse)
 async def setup_webhook():
@@ -210,3 +207,4 @@ async def setup_webhook():
         raise HTTPException(400, "Set PUBLIC_URL env var")
     ok = await bot.set_webhook(url=f"{PUBLIC_URL}{WEBHOOK_PATH}")
     return "webhook set" if ok else "failed"
+
