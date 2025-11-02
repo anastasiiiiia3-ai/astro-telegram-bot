@@ -1,210 +1,308 @@
-import os, re, uuid
+import os
+import re
+import uuid
 from pathlib import Path
+from typing import Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
-from aiogram import Bot, Dispatcher, types, Router, F
-from aiogram.types import Update
+from fastapi.responses import PlainTextResponse, JSONResponse
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.types import Update, FSInputFile, BotCommand
 import httpx
 
-# ====== CONFIG ======
+# ===================== ENV =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL     = os.getenv("PUBLIC_URL")  # https://<имя-сервиса>.onrender.com
+PUBLIC_URL     = os.getenv("PUBLIC_URL")  # например: https://astro-telegram-bot-xxxx.onrender.com
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/tg/webhook")
 ASTRO_API      = os.getenv("ASTRO_API", "https://astro-ephemeris.onrender.com")
-TIMEOUT        = 30
+HTTP_TIMEOUT   = 30
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Set TELEGRAM_TOKEN env var")
+    raise RuntimeError("TELEGRAM_TOKEN is not set")
 
-# ====== TELEGRAM ======
+# ===================== TG CORE =================
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ====== HELPERS ======
-DATE_RE = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4}),\s*(\d{1,2}):(\d{2}),\s*(.+?),\s*(.+?)\s*$")
+# ===================== HELPERS =================
+DATE_RE = re.compile(
+    r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4}),\s*(\d{1,2}):(\d{2}),\s*(.+?),\s*(.+?)\s*$"
+)
 
-async def astro_run(payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(f"{ASTRO_API}/api/run", json=payload)
-        r.raise_for_status()
-        return r.json()
+SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы",
+         "Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
 
-def parse_datetime_city_country(text: str):
-    m = DATE_RE.match(text or "")
+def deg_to_sign(lon: float) -> str:
+    sign = SIGNS[int((lon % 360)//30)]
+    return f"{lon:.2f}° {sign}"
+
+def parse_line(s: str):
+    """Парсим: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна -> dict | None"""
+    m = DATE_RE.match(s or "")
     if not m:
         return None
-    d, mth, y, hh, mm, city, country = m.groups()
-    iso = f"{int(y):04d}-{int(mth):02d}-{int(d):02d}T{int(hh):02d}:{int(mm):02d}"
+    d, mo, y, hh, mm, city, country = m.groups()
+    iso = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}T{int(hh):02d}:{int(mm):02d}"
     return {"datetime_local": iso, "city": city.strip(), "country": country.strip()}
 
-def fmt_usage() -> str:
+def usage() -> str:
     return (
-        "Привет! Я астробот на Swiss Ephemeris.\n\n"
-        "Форматы команд:\n"
+        "Привет! Я астробот на точных эфемеридах.\n\n"
+        "Команды:\n"
         "• /natal  — `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
         "• /horary — `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
-        "• /synastry — две строки подряд после команды:\n"
+        "• /synastry — отправь две строки подряд после команды:\n"
         "  A: `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
         "  B: `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
     )
 
-# ====== PDF ======
+async def api_post(path: str, json: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
+        r = await cl.post(f"{ASTRO_API}{path}", json=json)
+        r.raise_for_status()
+        return r.json()
+
+async def resolve_place(city: str, country: str) -> Dict[str, Any]:
+    return await api_post("/api/resolve", {"city": city, "country": country})
+
+# ===================== PDF (ReportLab) =================
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-SIGNS = ["Овен","Телец","Близнецы","Рак","Лев","Дева","Весы","Скорпион","Стрелец","Козерог","Водолей","Рыбы"]
-def deg_sign(x: float) -> str:
-    sign = SIGNS[int((x % 360)//30)]
-    return f"{x:.2f}° {sign}"
+_FONTS_READY = False
+def ensure_fonts():
+    """Пытаемся подключить DejaVuSans для кириллицы. Если файла нет — используем Helvetica."""
+    global _FONTS_READY
+    if _FONTS_READY:
+        return
+    try:
+        font_path = Path("fonts/DejaVuSans.ttf")
+        if font_path.exists():
+            pdfmetrics.registerFont(TTFont("DejaVuSans", str(font_path)))
+            _FONTS_READY = True
+        else:
+            _FONTS_READY = False
+    except Exception:
+        _FONTS_READY = False
 
-STYLES = None
-def init_styles():
-    global STYLES
-    if STYLES: return
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H1", fontName="Helvetica", fontSize=16, leading=20, spaceAfter=8))
-    styles.add(ParagraphStyle(name="H2", fontName="Helvetica", fontSize=13, leading=16, spaceAfter=6))
-    styles.add(ParagraphStyle(name="P",  fontName="Helvetica", fontSize=10, leading=14))
-    STYLES = styles
+def style(name: str, size=11, leading=15, bold=False):
+    ensure_fonts()
+    base = "DejaVuSans" if _FONTS_READY else "Helvetica"
+    return ParagraphStyle(
+        name=name,
+        fontName=base,
+        fontSize=size,
+        leading=leading,
+        spaceAfter=6,
+    )
 
-def mk_table(data, colWidths=None):
-    t = Table(data, colWidths=colWidths)
+def table(data: List[List[str]], widths=None):
+    t = Table(data, colWidths=widths)
     t.setStyle(TableStyle([
-        ("FONT", (0,0), (-1,-1), "Helvetica", 10),
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f2f5")),
+        ("FONT", (0,0), (-1,-1), "DejaVuSans" if _FONTS_READY else "Helvetica", 10),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f4f7")),
         ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#d1d5db")),
         ("LEFTPADDING",(0,0),(-1,-1),6), ("RIGHTPADDING",(0,0),(-1,-1),6),
         ("TOPPADDING",(0,0),(-1,-1),4), ("BOTTOMPADDING",(0,0),(-1,-1),4),
     ]))
     return t
 
-def build_pdf(mode: str, payload: dict, out_path: Path) -> Path:
-    init_styles()
-    doc = SimpleDocTemplate(str(out_path), pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+def mk_pdf(mode: str, payload: Dict[str, Any], text: str, fname: str) -> Path:
+    fpath = Path("/tmp")/fname
+    doc = SimpleDocTemplate(str(fpath), pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     flow = []
-    flow += [Paragraph("Astro Report", STYLES["H1"]), Spacer(1, 6), Paragraph(f"Режим: {mode.upper()}", STYLES["P"])]
+    flow += [Paragraph("Astro Report", style("H1", 16, 20)), Spacer(1, 6),
+             Paragraph(f"Режим: {mode.upper()}", style("P", 10, 14)),
+             Spacer(1, 8)]
 
+    # ——— Общая часть
     if mode in ("natal","horary"):
         chart = payload["chart"] if mode == "horary" else payload
-        dt = chart["datetime_local"]; lat = chart["lat"]; lon = chart["lon"]; tz = chart["iana_tz"]
-        asc = chart["houses"]["asc"]; mc = chart["houses"]["mc"]
-        planets = {p["name"]: p for p in chart["planets"]}
-
-        flow += [Spacer(1,8), Paragraph("Контрольные позиции", STYLES["H2"])]
         rows = [["Точка","Положение"]]
+        planets = {p["name"]: p for p in chart["planets"]}
         for key, label in [("Sun","Солнце ☉"), ("Moon","Луна ☽"), ("Mercury","Меркурий ☿"),
                            ("Venus","Венера ♀"), ("Mars","Марс ♂"), ("Jupiter","Юпитер ♃"), ("Saturn","Сатурн ♄")]:
             if key in planets:
-                rows.append([label, deg_sign(planets[key]["lon"])])
-        rows += [["ASC", deg_sign(asc)], ["MC", deg_sign(mc)]]
-        flow.append(mk_table(rows, [140, 260]))
+                rows.append([label, deg_to_sign(planets[key]["lon"])])
+        rows += [["ASC", deg_to_sign(chart["houses"]["asc"])],
+                 ["MC",  deg_to_sign(chart["houses"]["mc"])]]
+        flow += [Paragraph("Контрольные позиции", style("H2", 13, 16)), table(rows, [150, 290]), Spacer(1, 8)]
 
-        flow += [Spacer(1,10), Paragraph(f"Дата/время: {dt}  |  Координаты: {lat:.4f}, {lon:.4f}  |  TZ: {tz}", STYLES["P"])]
-
-        if mode == "horary":
-            moon = payload["moon"]
-            flow += [Spacer(1,8), Paragraph("Хорар — Луна", STYLES["H2"])]
-            voc = "VOC (без курса)" if moon.get("voc") else "Есть применяющийся аспект"
-            rows = [["Параметр","Значение"],
-                    ["Положение Луны", deg_sign(moon["lon"])],
-                    ["Статус", voc],
-                    ["Ближ. применяющийся аспект", moon.get("next_applying","—")]]
-            flow.append(mk_table(rows, [180, 220]))
+    if mode == "horary":
+        moon = payload.get("moon", {})
+        voc = "VOC (без курса)" if moon.get("voc") else "Есть применяющийся аспект"
+        rows = [["Параметр", "Значение"],
+                ["Положение Луны", deg_to_sign(moon.get("lon", 0.0))],
+                ["Статус", voc],
+                ["Ближайший применяющийся аспект", moon.get("next_applying","—")]]
+        flow += [Paragraph("Луна — хорарный контур", style("H2", 13, 16)), table(rows, [220, 220]), Spacer(1, 8)]
 
     if mode == "synastry":
         aspects = payload.get("aspects", [])[:10]
-        flow += [Spacer(1,8), Paragraph("Синастрия — ТОП-10 аспектов", STYLES["H2"])]
         rows = [["Планета A","Аспект","Планета B","Орб"]]
         for a in aspects:
             rows.append([a["p1"], a["aspect"], a["p2"], f'{a["orb"]:.2f}°'])
-        flow.append(mk_table(rows, [120,110,120,60]))
+        flow += [Paragraph("Синастрия — ТОП-10 аспектов", style("H2", 13, 16)), table(rows, [120,110,120,60]), Spacer(1, 8)]
+
+    flow += [Paragraph("Краткая интерпретация", style("H2", 13, 16)),
+             Paragraph(text or "—", style("P", 11, 16))]
 
     doc.build(flow)
-    return out_path
+    return fpath
 
-# ====== HANDLERS ======
-@router.message(F.text == "/start")
-async def start(m: types.Message):
-    await m.answer(fmt_usage(), parse_mode="Markdown")
+# ===================== TEXT TONES =================
+def warm_intro() -> str:
+    return (
+        "Ниже — краткая выжимка без перегруза терминами. "
+        "Смысл — помочь тебе лучше чувствовать свои процессы и принять ясные решения."
+    )
+
+def natal_text(chart: Dict[str, Any]) -> str:
+    """Мини-интерпретация без поэзии: тёпло, поддерживающе, конкретно."""
+    planets = {p["name"]: p for p in chart["planets"]}
+    sun, moon = planets.get("Sun"), planets.get("Moon")
+    asc = chart["houses"]["asc"]; mc = chart["houses"]["mc"]
+    lines = [warm_intro()]
+    if sun:  lines.append(f"☉ Солнце — {deg_to_sign(sun['lon'])}: основной вектор воли и жизненной энергии.")
+    if moon: lines.append(f"☽ Луна — {deg_to_sign(moon['lon'])}: способы заботы о себе и эмоциональные ритмы.")
+    lines.append(f"ASC — {deg_to_sign(asc)}: как тебя считывают с первого взгляда.")
+    lines.append(f"MC  — {deg_to_sign(mc)}: траектория развития и тема признания.")
+    return " ".join(lines)
+
+def horary_text(payload: Dict[str, Any]) -> str:
+    m = payload.get("moon", {})
+    status = "луна без курса — ситуация тянется" if m.get("voc") else "луна идёт к аспекту — событие развивается"
+    asp = m.get("next_applying", "аспект не выявлен")
+    return (
+        f"{warm_intro()} В хораре главное — сигнификаторы и Луна. "
+        f"По Луне: {status}; ближайший применяющийся аспект — {asp}. "
+        "Финальный ответ формулируем как Да/Нет/При условии после сопоставления сигнификаторов."
+    )
+
+def synastry_text(payload: Dict[str, Any]) -> str:
+    return (
+        f"{warm_intro()} В синастрии смотрим сочетание ☉/☽/ASC и личных планет. "
+        "Гармоничные трины/секстили — зоны притяжения и лёгкости; квадраты/оппозиции — точки роста, "
+        "где важны договорённости и регулярная обратная связь."
+    )
+
+# ===================== COMMANDS =================
+@router.message(F.text.startswith("/start"))
+async def cmd_start(m: types.Message):
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Как пользоваться"),
+        BotCommand(command="help", description="Подсказка по формату"),
+        BotCommand(command="natal", description="Натальная карта"),
+        BotCommand(command="horary", description="Хорарный вопрос"),
+        BotCommand(command="synastry", description="Совместимость (2 строки)"),
+    ])
+    await m.answer(usage(), parse_mode="Markdown")
+
+@router.message(F.text.startswith("/help"))
+async def cmd_help(m: types.Message):
+    await m.answer(usage(), parse_mode="Markdown")
 
 @router.message(F.text.regexp(r"^/natal($|\s)"))
 async def cmd_natal(m: types.Message):
-    payload = m.text.replace("/natal", "", 1).strip()
-    parsed = parse_datetime_city_country(payload)
+    src = m.text.replace("/natal", "", 1).strip()
+    parsed = parse_line(src)
     if not parsed:
-        await m.answer("Дай данные так:\n`/natal 17.08.2002, 15:20, Кострома, Россия`", parse_mode="Markdown"); return
-    body = {"mode": "natal", **parsed, "house_system": "Placidus"}
-    try:
-        data = await astro_run(body)
-        await m.answer(data.get("text", "Готово."))
-        fname = f"astro_natal_{uuid.uuid4().hex[:8]}.pdf"
-        pdf_path = build_pdf("natal", data.get("payload", {}), Path("/tmp")/fname)
-        from aiogram.types import FSInputFile
-        await m.answer_document(FSInputFile(str(pdf_path)), caption="📄 Натальная карта — PDF")
-    except httpx.HTTPError as e:
-        await m.answer(f"Ошибка расчёта: {e}")
+        return await m.answer("Пожалуйста так: `/natal 17.08.2002, 15:20, Кострома, Россия`", parse_mode="Markdown")
+
+    # 1) геокод
+    loc = await resolve_place(parsed["city"], parsed["country"])
+    body = {
+        "datetime_local": parsed["datetime_local"],
+        "lat": loc["lat"], "lon": loc["lon"], "iana_tz": loc["iana_tz"],
+        "house_system": "Placidus"
+    }
+    # 2) карта
+    data = await api_post("/api/chart", body)
+    chart = data["chart"]
+
+    # ответ тёплым тоном
+    txt = natal_text(chart)
+    # pdf
+    pdf = mk_pdf("natal", chart, txt, f"astro_natal_{uuid.uuid4().hex[:8]}.pdf")
+    await m.answer(txt)
+    await m.answer_document(FSInputFile(str(pdf)), caption="📄 Натальная карта — PDF")
 
 @router.message(F.text.regexp(r"^/horary($|\s)"))
 async def cmd_horary(m: types.Message):
-    payload = m.text.replace("/horary", "", 1).strip()
-    parsed = parse_datetime_city_country(payload)
+    src = m.text.replace("/horary", "", 1).strip()
+    parsed = parse_line(src)
     if not parsed:
-        await m.answer("Дай данные так:\n`/horary 04.07.2025, 22:17, Москва, Россия`", parse_mode="Markdown"); return
-    body = {"mode": "horary", **parsed, "house_system": "Regiomontanus"}
-    try:
-        data = await astro_run(body)
-        await m.answer(data.get("text", "Готово."))
-        fname = f"astro_horary_{uuid.uuid4().hex[:8]}.pdf"
-        pdf_path = build_pdf("horary", data.get("payload", {}), Path("/tmp")/fname)
-        from aiogram.types import FSInputFile
-        await m.answer_document(FSInputFile(str(pdf_path)), caption="📄 Хорар — PDF")
-    except httpx.HTTPError as e:
-        await m.answer(f"Ошибка расчёта: {e}")
+        return await m.answer("Так: `/horary 04.07.2025, 22:17, Москва, Россия`", parse_mode="Markdown")
+
+    loc = await resolve_place(parsed["city"], parsed["country"])
+    body = {
+        "datetime_local": parsed["datetime_local"],
+        "lat": loc["lat"], "lon": loc["lon"], "iana_tz": loc["iana_tz"],
+        "house_system": "Regiomontanus"
+    }
+    data = await api_post("/api/horary", body)  # {chart:{...}, moon:{...}}
+    txt  = horary_text(data)
+    pdf  = mk_pdf("horary", data, txt, f"astro_horary_{uuid.uuid4().hex[:8]}.pdf")
+    await m.answer(txt)
+    await m.answer_document(FSInputFile(str(pdf)), caption="📄 Хорар — PDF")
 
 @router.message(F.text.regexp(r"^/synastry($|\s)"))
 async def cmd_synastry(m: types.Message):
     rest = m.text.replace("/synastry", "", 1).strip()
     lines = [ln.strip() for ln in rest.split("\n") if ln.strip()]
     if len(lines) < 2:
-        ex = "Пожалуйста двумя строками:\n`/synastry`\n`17.08.2002, 15:20, Кострома, Россия`\n`04.07.1995, 12:00, Москва, Россия`"
-        await m.answer(ex, parse_mode="Markdown"); return
-    pa = parse_datetime_city_country(lines[0]); pb = parse_datetime_city_country(lines[1])
-    if not pa or not pb:
-        await m.answer("Проверь формат строк A и B."); return
-    body = {"mode": "synastry", "a": pa, "b": pb}
-    try:
-        data = await astro_run(body)
-        await m.answer(data.get("text", "Готово."))
-        fname = f"astro_synastry_{uuid.uuid4().hex[:8]}.pdf"
-        pdf_path = build_pdf("synastry", data.get("payload", {}), Path("/tmp")/fname)
-        from aiogram.types import FSInputFile
-        await m.answer_document(FSInputFile(str(pdf_path)), caption="📄 Синастрия — PDF")
-    except httpx.HTTPError as e:
-        await m.answer(f"Ошибка расчёта: {e}")
+        return await m.answer(
+            "Отправь двумя строками после команды:\n"
+            "`/synastry`\n"
+            "`17.08.2002, 15:20, Кострома, Россия`\n"
+            "`04.07.1995, 12:00, Москва, Россия`",
+            parse_mode="Markdown"
+        )
+    a = parse_line(lines[0]); b = parse_line(lines[1])
+    if not a or not b:
+        return await m.answer("Проверь формат двух строк. Должно быть как в примере.", parse_mode="Markdown")
 
-# ====== FASTAPI app + webhook ======
-app = FastAPI(title="Astro TG Bot")
+    la = await resolve_place(a["city"], a["country"])
+    lb = await resolve_place(b["city"], b["country"])
+    body = {
+        "a": {"datetime_local": a["datetime_local"], "lat": la["lat"], "lon": la["lon"], "iana_tz": la["iana_tz"], "house_system": "Placidus"},
+        "b": {"datetime_local": b["datetime_local"], "lat": lb["lat"], "lon": lb["lon"], "iana_tz": lb["iana_tz"], "house_system": "Placidus"},
+    }
+    data = await api_post("/api/synastry", body)  # {a:{chart}, b:{chart}, aspects:[...]}
+    txt  = synastry_text(data)
+    pdf  = mk_pdf("synastry", data, txt, f"astro_synastry_{uuid.uuid4().hex[:8]}.pdf")
+    await m.answer(txt)
+    await m.answer_document(FSInputFile(str(pdf)), caption="📄 Синастрия — PDF")
+
+# Фолбэк на всё остальное — дружелюбно подсказываем формат
+@router.message(F.text.regexp(r"^/"))
+async def unknown_cmd(m: types.Message):
+    await m.answer("Команда не распознана. Нажми /help — там формат и примеры.")
+
+# ===================== FASTAPI =================
+app = FastAPI(title="Astro Telegram Bot")
 
 @app.get("/health")
-def health(): 
+def health():
     return {"ok": True}
 
-# Принимаем вебхук напрямую и кормим апдейт диспетчеру
-@app.post(os.getenv("WEBHOOK_PATH", "/tg/webhook"))
-async def telegram_webhook(update: dict):
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(update: Dict[str, Any]):
+    """Принимаем апдейты напрямую (без специальных интеграций aiogram)"""
     await dp.feed_update(bot, Update.model_validate(update))
-    return {"ok": True}
+    return JSONResponse({"ok": True})
 
 @app.get("/setup", response_class=PlainTextResponse)
 async def setup_webhook():
-    """Установить вебхук: PUBLIC_URL + WEBHOOK_PATH"""
     if not PUBLIC_URL:
-        raise HTTPException(400, "Set PUBLIC_URL env var")
-    ok = await bot.set_webhook(url=f"{PUBLIC_URL}{WEBHOOK_PATH}")
+        raise HTTPException(400, "PUBLIC_URL is not set")
+    ok = await bot.set_webhook(f"{PUBLIC_URL}{WEBHOOK_PATH}")
     return "webhook set" if ok else "failed"
+
 
