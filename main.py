@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -12,10 +13,9 @@ import httpx
 
 # ===================== ENV =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL     = os.getenv("PUBLIC_URL")  # например: https://astro-telegram-bot-xxxx.onrender.com
+PUBLIC_URL     = os.getenv("PUBLIC_URL")            # напр.: https://astro-telegram-bot-xxxx.onrender.com
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/tg/webhook")
 ASTRO_API      = os.getenv("ASTRO_API", "https://astro-ephemeris.onrender.com")
-HTTP_TIMEOUT   = 30
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -58,11 +58,39 @@ def usage() -> str:
         "  B: `ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна`\n"
     )
 
+# ===================== HTTP к astro-ephemeris (с прогревом и ретраями) =================
+HTTP_TIMEOUT = 60
+WARMUP_URL   = f"{ASTRO_API}/health"
+
+async def warmup_backend():
+    """Мягко будим astro-ephemeris перед первым тяжёлым запросом."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as cl:
+            await cl.get(WARMUP_URL)
+    except Exception:
+        pass  # прогрев может упасть — не страшно
+
 async def api_post(path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        r = await cl.post(f"{ASTRO_API}{path}", json=json)
-        r.raise_for_status()
-        return r.json()
+    """
+    POST с ретраями: выдерживает cold start (502/504/timeout).
+    Попыток: 4, с паузами 1s → 2s → 4s.
+    """
+    url = f"{ASTRO_API}{path}"
+    await warmup_backend()
+
+    last_err = None
+    for attempt in range(4):
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
+                r = await cl.post(url, json=json)
+                r.raise_for_status()
+                return r.json()
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.HTTPStatusError) as e:
+            last_err = e
+            if isinstance(e, httpx.HTTPStatusError) and (400 <= e.response.status_code < 500):
+                break  # 4xx — ретраить бессмысленно
+            await asyncio.sleep(2 ** attempt)
+    raise HTTPException(status_code=502, detail=f"backend error: {repr(last_err)}")
 
 async def resolve_place(city: str, country: str) -> Dict[str, Any]:
     return await api_post("/api/resolve", {"city": city, "country": country})
@@ -70,7 +98,7 @@ async def resolve_place(city: str, country: str) -> Dict[str, Any]:
 # ===================== PDF (ReportLab) =================
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -91,7 +119,7 @@ def ensure_fonts():
     except Exception:
         _FONTS_READY = False
 
-def style(name: str, size=11, leading=15, bold=False):
+def style(name: str, size=11, leading=15):
     ensure_fonts()
     base = "DejaVuSans" if _FONTS_READY else "Helvetica"
     return ParagraphStyle(
@@ -121,7 +149,6 @@ def mk_pdf(mode: str, payload: Dict[str, Any], text: str, fname: str) -> Path:
              Paragraph(f"Режим: {mode.upper()}", style("P", 10, 14)),
              Spacer(1, 8)]
 
-    # ——— Общая часть
     if mode in ("natal","horary"):
         chart = payload["chart"] if mode == "horary" else payload
         rows = [["Точка","Положение"]]
@@ -164,7 +191,6 @@ def warm_intro() -> str:
     )
 
 def natal_text(chart: Dict[str, Any]) -> str:
-    """Мини-интерпретация без поэзии: тёпло, поддерживающе, конкретно."""
     planets = {p["name"]: p for p in chart["planets"]}
     sun, moon = planets.get("Sun"), planets.get("Moon")
     asc = chart["houses"]["asc"]; mc = chart["houses"]["mc"]
@@ -188,8 +214,7 @@ def horary_text(payload: Dict[str, Any]) -> str:
 def synastry_text(payload: Dict[str, Any]) -> str:
     return (
         f"{warm_intro()} В синастрии смотрим сочетание ☉/☽/ASC и личных планет. "
-        "Гармоничные трины/секстили — зоны притяжения и лёгкости; квадраты/оппозиции — точки роста, "
-        "где важны договорённости и регулярная обратная связь."
+        "Гармоничные трины/секстили — зоны притяжения; квадраты/оппозиции — точки роста и договорённостей."
     )
 
 # ===================== COMMANDS =================
@@ -215,20 +240,15 @@ async def cmd_natal(m: types.Message):
     if not parsed:
         return await m.answer("Пожалуйста так: `/natal 17.08.2002, 15:20, Кострома, Россия`", parse_mode="Markdown")
 
-    # 1) геокод
     loc = await resolve_place(parsed["city"], parsed["country"])
     body = {
         "datetime_local": parsed["datetime_local"],
         "lat": loc["lat"], "lon": loc["lon"], "iana_tz": loc["iana_tz"],
         "house_system": "Placidus"
     }
-    # 2) карта
     data = await api_post("/api/chart", body)
     chart = data["chart"]
-
-    # ответ тёплым тоном
     txt = natal_text(chart)
-    # pdf
     pdf = mk_pdf("natal", chart, txt, f"astro_natal_{uuid.uuid4().hex[:8]}.pdf")
     await m.answer(txt)
     await m.answer_document(FSInputFile(str(pdf)), caption="📄 Натальная карта — PDF")
@@ -246,7 +266,7 @@ async def cmd_horary(m: types.Message):
         "lat": loc["lat"], "lon": loc["lon"], "iana_tz": loc["iana_tz"],
         "house_system": "Regiomontanus"
     }
-    data = await api_post("/api/horary", body)  # {chart:{...}, moon:{...}}
+    data = await api_post("/api/horary", body)
     txt  = horary_text(data)
     pdf  = mk_pdf("horary", data, txt, f"astro_horary_{uuid.uuid4().hex[:8]}.pdf")
     await m.answer(txt)
@@ -274,13 +294,12 @@ async def cmd_synastry(m: types.Message):
         "a": {"datetime_local": a["datetime_local"], "lat": la["lat"], "lon": la["lon"], "iana_tz": la["iana_tz"], "house_system": "Placidus"},
         "b": {"datetime_local": b["datetime_local"], "lat": lb["lat"], "lon": lb["lon"], "iana_tz": lb["iana_tz"], "house_system": "Placidus"},
     }
-    data = await api_post("/api/synastry", body)  # {a:{chart}, b:{chart}, aspects:[...]}
+    data = await api_post("/api/synastry", body)
     txt  = synastry_text(data)
     pdf  = mk_pdf("synastry", data, txt, f"astro_synastry_{uuid.uuid4().hex[:8]}.pdf")
     await m.answer(txt)
     await m.answer_document(FSInputFile(str(pdf)), caption="📄 Синастрия — PDF")
 
-# Фолбэк на всё остальное — дружелюбно подсказываем формат
 @router.message(F.text.regexp(r"^/"))
 async def unknown_cmd(m: types.Message):
     await m.answer("Команда не распознана. Нажми /help — там формат и примеры.")
@@ -288,14 +307,25 @@ async def unknown_cmd(m: types.Message):
 # ===================== FASTAPI =================
 app = FastAPI(title="Astro Telegram Bot")
 
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "ok"
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(update: Dict[str, Any]):
-    """Принимаем апдейты напрямую (без специальных интеграций aiogram)"""
-    await dp.feed_update(bot, Update.model_validate(update))
+async def telegram_webhook(update: dict):
+    # Терпимый к формату хук (без строгой валидации pydantic)
+    try:
+        await dp.feed_update(bot, Update(**update))
+    except Exception:
+        try:
+            upd = Update.model_validate(update)
+            await dp.feed_update(bot, upd)
+        except Exception as e:
+            print("WEBHOOK ERROR:", repr(e))
     return JSONResponse({"ok": True})
 
 @app.get("/setup", response_class=PlainTextResponse)
@@ -304,5 +334,3 @@ async def setup_webhook():
         raise HTTPException(400, "PUBLIC_URL is not set")
     ok = await bot.set_webhook(f"{PUBLIC_URL}{WEBHOOK_PATH}")
     return "webhook set" if ok else "failed"
-
-
