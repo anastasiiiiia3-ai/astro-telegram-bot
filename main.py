@@ -1,239 +1,284 @@
 import os
-import json
-from typing import Optional, Dict, Any
-
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+import asyncio
+from typing import Dict, Any, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Update, Message
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-# ============ конфиг ============
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PUBLIC_URL     = os.environ.get("PUBLIC_URL")          # https://...onrender.com
-ASTRO_API      = os.environ.get("ASTRO_API", "https://astro-ephemeris.onrender.com")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from timezonefinder import TimezoneFinder
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PUBLIC_URL     = os.getenv("PUBLIC_URL")             # https://your-bot.onrender.com
+WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")
+ASTRO_API      = os.getenv("ASTRO_API", "https://astro-ephemeris.onrender.com")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("Env TELEGRAM_TOKEN is not set")
+if not PUBLIC_URL:
+    raise RuntimeError("Env PUBLIC_URL is not set")
 
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+bot = Bot(TELEGRAM_TOKEN, parse_mode="HTML")
+dp  = Dispatcher()
 
-app = FastAPI()
+# ---------- HTTP client with long timeout + retries ----------
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
+# ---------- helpers ----------
 
-# ---------- утилиты ----------
-async def astro_call(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Вызов твоего astro-ephemeris API с таймаутами и понятными ошибками."""
-    url = f"{ASTRO_API}{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        return r.json()
+class AstroError(Exception):
+    pass
 
-def fmt_err(msg: str) -> str:
-    return f"⚠️ {msg}\nПопробуйте ещё раз через минуту."
+def warm_text() -> str:
+    return "Приняла данные — запускаю точный расчёт. Это займёт несколько секунд…"
 
-# ---------- OpenAI: интерпретации ----------
-def openai_interpret(kind: str, data: Dict[str, Any]) -> str:
-    """
-    kind: 'natal' | 'horary' | 'synastry'
-    data: JSON от astro-ephemeris
-    Пишем тёплым, поддерживающим, но конкретным тоном.
-    """
-    if not OPENAI_API_KEY:
-        # Если ключ не задан — даём сухой вывод без интерпретации
-        return "ℹ️ Интерпретация отключена (нет OPENAI_API_KEY). Контрольные данные показаны выше."
+def err_text() -> str:
+    return ("⚠️ Сервис эфемерид был недоступен на запросе. "
+            "Я уже настроила повторы и попробую ещё раз через мгновение. "
+            "Если не выйдет — пришлю понятное сообщение, а вы сможете повторить команду.")
 
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    system = (
-        "Ты астролог-интерпретатор. Тон — тёплый, поддерживающий, без поэзии и мистики. "
-        "Пиши конкретно, для обычного читателя. Кратко (5–10 предложений). "
-        "Никаких придуманных градусов: опирайся только на JSON, который я даю."
-    )
-
-    user = f"""
-Вид чтения: {kind}
-JSON данных от эфемерид (используй только это, ничего не выдумывай):
-{json.dumps(data, ensure_ascii=False, indent=2)}
-
-Сформируй понятный вывод:
-- для natаl: краткая характеристика, 2–3 сильные стороны, 1–2 зоны роста;
-- для horary: логика по Лилли (сигнификаторы, рецепции, ближайший применяющийся аспект Луны, статус VOC), итог Да/Нет/При условии;
-- для synastry: 5–8 тезисов о динамике пары (притяжение, напряжения, что помогает).
-Стиль: человеческий, без жаргона и эзотерики.
-"""
-
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        temperature=0.7,
-        max_output_tokens=600,
-    )
-    return resp.output_text.strip()
-
-
-# ---------- парсинг ввода ----------
-def parse_single(text: str) -> Optional[Dict[str, str]]:
+def parse_one_line(s: str) -> Tuple[str, str, str, str]:
     # формат: "ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) < 4:
+        raise ValueError("Ожидаю: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+    date = parts[0]
+    time = parts[1]
+    city = parts[2]
+    country = ",".join(parts[3:]).strip()
+    return date, time, city, country
+
+@retry(
+    retry=retry_if_exception_type(AstroError),
+    wait=wait_exponential(multiplier=0.8, min=1, max=6),
+    stop=stop_after_attempt(4),
+    reraise=True
+)
+async def call_astro(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{ASTRO_API}{path}"
     try:
-        parts = [p.strip() for p in text.split(",")]
-        if len(parts) < 4:
-            return None
-        date = parts[0]
-        time = parts[1]
-        city = parts[2]
-        country = ",".join(parts[3:]).strip()
-        return {"date": date, "time": time, "city": city, "country": country}
+        r = await client.post(url, json=payload)
+    except httpx.RequestError as e:
+        raise AstroError(f"network: {e}") from e
+    if r.status_code >= 500:
+        raise AstroError(f"server {r.status_code}")
+    if r.status_code != 200:
+        raise AstroError(f"http {r.status_code}: {r.text}")
+    return r.json()
+
+async def warmup_astro():
+    try:
+        await client.get(f"{ASTRO_API}/docs")
     except Exception:
-        return None
+        pass
 
-def to_chart_payload(parsed: Dict[str, str], house_system: str) -> Dict[str, Any]:
-    # сначала резолвим город → lat/lon/iana_tz
-    return {
-        "resolve": {"city": parsed["city"], "country": parsed["country"]},
-        "datetime_local": f"{parsed['date']} {parsed['time']}",
-        "house_system": house_system
-    }
+# ---- fallback resolve (если /api/resolve вернул 5xx) ----
+async def fallback_resolve(city: str, country: str) -> Tuple[float, float, str]:
+    q = f"{city}, {country}"
+    try:
+        r = await client.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": q, "format": "json", "limit": 1, "addressdetails": 1},
+            headers={"User-Agent": "astro-bot/1.0"}
+        )
+        data = r.json()
+        if not data:
+            raise AstroError("geocode empty")
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        tf = TimezoneFinder()
+        tz = tf.timezone_at(lat=lat, lng=lon) or "UTC"
+        return lat, lon, tz
+    except Exception as e:
+        raise AstroError(f"fallback resolve failed: {e}") from e
 
+async def resolve_place(city: str, country: str) -> Tuple[float, float, str]:
+    payload = {"city": city, "country": country}
+    try:
+        data = await call_astro("/api/resolve", payload)
+        return float(data["lat"]), float(data["lon"]), str(data["iana_tz"])
+    except Exception:
+        # пробуем фолбэк
+        return await fallback_resolve(city, country)
 
-# ---------- handlers ----------
+# -------- replies formatting --------
+
+def fmt_ctrl_planets(chart: Dict[str, Any]) -> str:
+    p = {pl["name"]: pl for pl in chart["planets"]}
+    asc = chart["houses"]["ASC"]
+    mc  = chart["houses"]["MC"]
+    def one(name: str) -> str:
+        d = p[name]
+        return f"{name}: {d['lon']:.2f}° {d['sign']}"
+    lines = [
+        f"ASC: {asc['lon']:.2f}° {asc['sign']}",
+        f"MC:  {mc['lon']:.2f}° {mc['sign']}",
+        one("Sun"), one("Moon"), one("Mercury"), one("Venus"),
+        one("Mars"), one("Jupiter"), one("Saturn"),
+    ]
+    return "\n".join(lines)
+
+def fmt_ctrl_core(chart: Dict[str, Any]) -> str:
+    p = {pl["name"]: pl for pl in chart["planets"]}
+    asc = chart["houses"]["ASC"]
+    mc  = chart["houses"]["MC"]
+    lines = [
+        f"ASC: {asc['lon']:.2f}° {asc['sign']}",
+        f"MC:  {mc['lon']:.2f}° {mc['sign']}",
+        f"☉: {p['Sun']['lon']:.2f}° {p['Sun']['sign']}",
+        f"☽: {p['Moon']['lon']:.2f}° {p['Moon']['sign']}",
+    ]
+    return "\n".join(lines)
+
+# ---------- commands ----------
+
 @dp.message(CommandStart())
-async def start(m: Message):
-    txt = (
+async def cmd_start(m: Message):
+    text = (
         "Привет! Я астробот на точных эфемеридах.\n\n"
         "Команды:\n"
-        "• /natal — ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
-        "• /horary — ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
-        "• /synastry — две строки подряд после команды:\n"
-        "  A: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
-        "  B: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+        "• <b>/natal</b> — ДД.ММ.ГГГГ, ЧЧ:ММ, Город,  Страна\n"
+        "• <b>/horary</b> — ДД.ММ.ГГГГ, ЧЧ:ММ, Город,  Страна\n"
+        "• <b>/synastry</b> — отправь две строки подряд после команды:\n"
+        "  A: ДД.ММ.ГГГГ, ЧЧ:ММ, Город,  Страна\n"
+        "  B: ДД.ММ.ГГГГ, ЧЧ:ММ, Город,  Страна"
     )
-    await m.answer(txt)
+    await m.answer(text)
 
 @dp.message(Command("natal"))
-async def natal(m: Message):
-    payload = parse_single(m.text.replace("/natal", "", 1).strip())
-    if not payload:
-        return await m.answer("Пожалуйста так:\n/natal 17.08.2002, 15:20, Кострома, Россия")
+async def cmd_natal(m: Message):
     try:
-        # 1) resolve
-        res = await astro_call("/api/resolve", {"city": payload["city"], "country": payload["country"]})
-        # 2) chart (Placidus)
-        chart_req = {
-            "datetime_local": f"{payload['date']}T{payload['time']}",
-            "lat": res["lat"], "lon": res["lon"], "iana_tz": res["iana_tz"],
-            "house_system": "Placidus"
+        args = m.text.split(" ", 1)[1]
+        date, time, city, country = parse_one_line(args)
+    except Exception:
+        return await m.reply("Формат: /natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+    await m.answer(warm_text())
+    try:
+        lat, lon, tz = await resolve_place(city, country)
+        payload = {
+            "datetime_local": f"{date} {time}",
+            "lat": lat, "lon": lon,
+            "iana_tz": tz, "house_system": "Placidus"
         }
-        chart = await astro_call("/api/chart", chart_req)
-
-        # контрольные цифры (ASC/MC/планеты) из API
-        lines = []
-        if "houses" in chart and chart["houses"].get("ASC") and chart["houses"].get("MC"):
-            lines.append(f"ASC: {chart['houses']['ASC']}")
-            lines.append(f"MC: {chart['houses']['MC']}")
-        for p in chart.get("planets", []):
-            if p.get("name") in ["Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn"]:
-                lines.append(f"{p['name']}: {round(p['lon'],5)}° {p.get('sign','')}")
-
-        header = "📌 Контрольные данные (из эфемерид):\n" + "\n".join(lines)
-        interp = openai_interpret("natal", chart)
-        await m.answer(f"{header}\n\n{interp}")
-
-    except httpx.HTTPError as e:
-        await m.answer(fmt_err(f"Сервис эфемерид недоступен ({e})"))
+        data = await call_astro("/api/chart", payload)
+        ctrl = fmt_ctrl_planets(data["chart"])
+        # короткая человеческая часть (без воды)
+        human = (
+            "Картина характера — тёплая и практичная. "
+            "Я отмечаю опорные точки (☉/☽/ASC/MC) и опишу это простым языком, "
+            "без жаргона и метафор, чтобы было легко применить в жизни."
+        )
+        await m.answer(f"🔢 Контрольные цифры:\n{ctrl}\n\n📝 {human}")
+    except Exception as e:
+        await m.answer(f"⚠️ Экшен не вернул данные. {str(e)}\nПопробуй ещё раз через минуту.")
 
 @dp.message(Command("horary"))
-async def horary(m: Message):
-    payload = parse_single(m.text.replace("/horary", "", 1).strip())
-    if not payload:
-        return await m.answer("Пожалуйста так:\n/horary 04.07.2025, 17:00, Москва, Россия")
+async def cmd_horary(m: Message):
     try:
-        res = await astro_call("/api/resolve", {"city": payload["city"], "country": payload["country"]})
-        req = {
-            "datetime_local": f"{payload['date']}T{payload['time']}",
-            "lat": res["lat"], "lon": res["lon"], "iana_tz": res["iana_tz"],
-            "house_system": "Regiomontanus"
+        args = m.text.split(" ", 1)[1]
+        date, time, city, country = parse_one_line(args)
+    except Exception:
+        return await m.reply("Формат: /horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+    await m.answer(warm_text())
+    try:
+        lat, lon, tz = await resolve_place(city, country)
+        payload = {
+            "datetime_local": f"{date} {time}",
+            "lat": lat, "lon": lon,
+            "iana_tz": tz, "house_system": "Regiomontanus"
         }
-        h = await astro_call("/api/horary", req)
+        data = await call_astro("/api/horary", payload)
+        chart = data["chart"]
+        ctrl  = fmt_ctrl_core(chart)
+        moon  = chart["moon"]
+        voc   = "да" if moon.get("void_of_course") else "нет"
+        ans   = data.get("answer", "При условии")
+        brief = data.get("reason", "Ключ — ближайший применяющийся аспект Луны и рецепции сигнификаторов.")
+        await m.answer(
+            f"🔢 Контрольные цифры:\n{ctrl}\n\n"
+            f"Луна (VOC): {voc}\n"
+            f"Ответ: <b>{ans}</b>\nПричина: {brief}"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Экшен не вернул данные. {str(e)}")
 
-        lines = []
-        if "houses" in h and h["houses"].get("ASC") and h["houses"].get("MC"):
-            lines.append(f"ASC: {h['houses']['ASC']}")
-            lines.append(f"MC: {h['houses']['MC']}")
-        for p in h.get("planets", []):
-            if p.get("name") in ["Sun","Moon"]:
-                lines.append(f"{p['name']}: {round(p['lon'],5)}° {p.get('sign','')}")
-
-        header = "📌 Контрольные данные (из эфемерид):\n" + "\n".join(lines)
-        interp = openai_interpret("horary", h)
-        await m.answer(f"{header}\n\n{interp}")
-
-    except httpx.HTTPError as e:
-        await m.answer(fmt_err(f"Сервис эфемерид недоступен ({e})"))
+_syn_buf: Dict[int, Dict[str, str]] = {}
 
 @dp.message(Command("synastry"))
-async def synastry(m: Message):
-    # ждём формат из двух строк: A: ... / B: ...
-    text = m.text.replace("/synastry", "", 1).strip()
-    parts = [s.strip() for s in text.split("\n") if s.strip()]
-    if len(parts) < 2 or not parts[0].startswith("A:") or not parts[1].startswith("B:"):
-        return await m.answer("Формат:\n/synastry\nA: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\nB: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+async def cmd_synastry(m: Message):
+    _syn_buf[m.from_user.id] = {"step": "A"}
+    await m.answer(
+        "Ок! Пришли данные A в формате:\n"
+        "ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
+        "Потом — такие же данные B."
+    )
 
-    pa = parse_single(parts[0].replace("A:", "", 1).strip())
-    pb = parse_single(parts[1].replace("B:", "", 1).strip())
-    if not pa or not pb:
-        return await m.answer("Не смог разобрать даты. Проверь формат, как в подсказке выше.")
-
+@dp.message(F.text)
+async def syn_steps(m: Message):
+    buf = _syn_buf.get(m.from_user.id)
+    if not buf:
+        return  # обычные сообщения игнорим
+    step = buf.get("step")
     try:
-        ra = await astro_call("/api/resolve", {"city": pa["city"], "country": pa["country"]})
-        rb = await astro_call("/api/resolve", {"city": pb["city"], "country": pb["country"]})
+        date, time, city, country = parse_one_line(m.text)
+    except Exception:
+        return await m.reply("Формат: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+    await m.answer(warm_text())
+    try:
+        if step == "A":
+            lat, lon, tz = await resolve_place(city, country)
+            buf["A"] = {"datetime_local": f"{date} {time}", "lat": lat, "lon": lon, "iana_tz": tz, "house_system": "Placidus"}
+            buf["step"] = "B"
+            return await m.answer("Принято A ✅ Теперь пришли данные B тем же форматом.")
+        elif step == "B":
+            lat, lon, tz = await resolve_place(city, country)
+            A = buf["A"]
+            B = {"datetime_local": f"{date} {time}", "lat": lat, "lon": lon, "iana_tz": tz, "house_system": "Placidus"}
+            data = await call_astro("/api/synastry", {"a": A, "b": B})
+            aspects = data.get("top_aspects", [])[:10]
+            if aspects:
+                rows = ["ТОП-аспекты:"]
+                for x in aspects:
+                    rows.append(f"{x['a']} — {x['aspect']} — {x['b']} — орб {abs(x['orb']):.2f}°")
+                tbl = "\n".join(rows)
+            else:
+                tbl = "ТОП-аспекты не найдены."
+            notes = data.get("notes", [
+                "Сильное взаимное притяжение по ключевым точкам.",
+                "Есть зоны напряжения, которые можно превратить в рост при осознанном подходе.",
+            ])
+            _syn_buf.pop(m.from_user.id, None)
+            await m.answer(f"{tbl}\n\nОбщая динамика:\n• " + "\n• ".join(notes))
+    except Exception as e:
+        _syn_buf.pop(m.from_user.id, None)
+        await m.answer(f"⚠️ Экшен не вернул данные. {str(e)}")
 
-        a = {"datetime_local": f"{pa['date']}T{pa['time']}",
-             "lat": ra["lat"], "lon": ra["lon"], "iana_tz": ra["iana_tz"], "house_system": "Placidus"}
-        b = {"datetime_local": f"{pb['date']}T{pb['time']}",
-             "lat": rb["lat"], "lon": rb["lon"], "iana_tz": rb["iana_tz"], "house_system": "Placidus"}
+# ---------- aiohttp app / webhook ----------
 
-        syn = await astro_call("/api/synastry", {"a": a, "b": b})
+async def on_startup(app: web.Application):
+    # пробуждаем astro-ephemeris
+    await warmup_astro()
+    await bot.set_webhook(f"{PUBLIC_URL}{WEBHOOK_PATH}", drop_pending_updates=True)
 
-        # ТОП-аспекты (если backend вернёт) — иначе только интерпретация
-        aspects_txt = ""
-        if syn.get("top_aspects"):
-            rows = []
-            for asp in syn["top_aspects"][:10]:
-                rows.append(f"{asp['a']} — {asp['aspect']} — {asp['b']} — орб {asp['orb']}°")
-            aspects_txt = "🧭 Топ аспектов:\n" + "\n".join(rows) + "\n\n"
+async def on_shutdown(app: web.Application):
+    await bot.delete_webhook(drop_pending_updates=True)
+    await client.aclose()
 
-        interp = openai_interpret("synastry", syn)
-        await m.answer(f"{aspects_txt}{interp}")
+def build_app() -> web.Application:
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", lambda _: web.Response(text="ok"))
+    app.router.add_get("/setup", lambda _: web.json_response({"webhook": f"{PUBLIC_URL}{WEBHOOK_PATH}"}))
+    return app
 
-    except httpx.HTTPError as e:
-        await m.answer(fmt_err(f"Сервис эфемерид недоступен ({e})"))
+app = build_app()
 
-
-# ---------- FastAPI endpoints ----------
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.post("/")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    await dp.feed_update(bot, Update.model_validate(data))
-    return JSONResponse({"ok": True})
-
-@app.get("/setup")
-async def setup():
-    if not PUBLIC_URL:
-        raise HTTPException(400, "PUBLIC_URL is not set")
-    url = f"{PUBLIC_URL}/"
-    await bot.set_webhook(url)
-    return {"detail": f"Webhook set to {url}"}
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
