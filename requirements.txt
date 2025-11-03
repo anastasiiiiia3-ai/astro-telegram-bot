@@ -1,4 +1,3 @@
-# Telegram + веб + PDF
 aiogram==3.4.1
 fastapi==0.110.1
 uvicorn==0.29.0
@@ -6,7 +5,10 @@ httpx==0.27.2
 jinja2==3.1.4
 reportlab==4.2.2
 
-# Совместимость с aiogram 3.4.x
+# Совместимо с aiogram 3.4.x
 pydantic==2.5.3
 pydantic-core==2.14.6
 typing_extensions>=4.7
+
+# OpenAI для интерпретаций
+openai>=1.40.0
