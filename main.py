@@ -13,7 +13,55 @@ from aiogram.filters import Command
 from aiogram.utils.markdown import hbold
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import asyncio
+
+USE_GPT = bool(OPENAI_API_KEY)
+if USE_GPT:
+    from openai import OpenAI
+    _gpt = OpenAI(api_key=OPENAI_API_KEY)
+
+SYSTEM_STYLE = (
+    "Ты астролог-консультант. Пиши по-русски, тёпло и поддерживающе, но конкретно и прагматично. "
+    "Избегай поэтических метафор и эзотерического жаргона. Стиль: ясный, человеческий. "
+    "Не придумывай градусов — пользуешься только переданными данными."
+)
+
+async def gpt_json(prompt: str, payload: dict, model: str = "gpt-4o-mini") -> dict:
+    """
+    Лёгкий собственный ретрай без внешних зависимостей:
+    3 попытки с эксп. бэкоффом 1s → 2s → 4s.
+    """
+    if not USE_GPT:
+        raise RuntimeError("GPT disabled")
+
+    messages = [
+        {"role": "system", "content": SYSTEM_STYLE},
+        {"role": "user", "content": prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+    delay = 1.0
+    for attempt in range(3):
+        try:
+            resp = await asyncio.to_thread(
+                _gpt.chat.completions.create,
+                model=model,
+                messages=messages,
+                temperature=0.7,
+            )
+            text = resp.choices[0].message.content.strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                text = text.split("\n", 1)[1] if "\n" in text else text
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"_raw": text}
+        except Exception as e:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
 from dateutil import parser as dtparser
 
 # ------------------ PDF (ReportLab) ------------------
