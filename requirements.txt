@@ -4,12 +4,9 @@ uvicorn==0.29.0
 httpx==0.27.2
 jinja2==3.1.4
 reportlab==4.2.2
-
-# Совместимо с aiogram 3.4.x
 pydantic==2.5.3
 pydantic-core==2.14.6
 typing_extensions>=4.7
-
-# OpenAI для интерпретаций
 openai>=1.40.0
+timezonefinder==6.2.0
 tenacity==8.2.3
