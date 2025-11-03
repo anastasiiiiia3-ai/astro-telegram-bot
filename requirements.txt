@@ -12,3 +12,4 @@ typing_extensions>=4.7
 
 # OpenAI для интерпретаций
 openai>=1.40.0
+tenacity==8.2.3
