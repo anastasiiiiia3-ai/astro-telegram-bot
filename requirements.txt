@@ -1,9 +1,13 @@
 aiogram==3.4.1
-fastapi==0.114.2
+fastapi==0.115.5
 uvicorn==0.30.6
+
+# HTTP клиент + ретраи
 httpx==0.27.2
-python-dateutil==2.9.0.post0
-timezonefinder==6.5.2
-reportlab==4.2.2
-openai==1.40.2
+tenacity==9.0.0
+
+# Pydantic: совместимо с aiogram 3.4.1 (нужен <2.6)
 pydantic==2.5.3
+
+# PDF c поддержкой кириллицы
+reportlab==4.2.2
