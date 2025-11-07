@@ -21,7 +21,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ASTRO_API = os.getenv("ASTRO_API", "https://astro-ephemeris.onrender.com")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://your-app.onrender.com
-WEBHOOK_PATH = "/webhook"
+WEBHOOK_PATH = "/webhook/astrohorary"  # Должен совпадать с тем, что Telegram шлёт
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -486,18 +486,23 @@ async def telegram_webhook(request: Request):
 @app.on_event("startup")
 async def on_startup():
     """Устанавливаем webhook при запуске"""
+    # ВСЕГДА сначала удаляем старый webhook
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🗑️ Старый webhook удалён")
+    
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
         try:
             await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            print(f"✅ Webhook set to {webhook_url}")
+            webhook_info = await bot.get_webhook_info()
+            print(f"✅ Webhook установлен: {webhook_info.url}")
         except Exception as e:
-            print(f"❌ Webhook error: {e}")
-            print("Starting polling instead...")
-            asyncio.create_task(dp.start_polling(bot))
+            print(f"❌ Ошибка webhook: {e}")
+            print("⚠️ Запускаю polling...")
+            asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     else:
-        print("⚠️ WEBHOOK_URL not set, starting polling mode")
-        asyncio.create_task(dp.start_polling(bot))
+        print("⚠️ WEBHOOK_URL не установлен, запускаю polling")
+        asyncio.create_task(dp.start_polling(bot, skip_updates=True))
 
 @app.on_event("shutdown")
 async def on_shutdown():
