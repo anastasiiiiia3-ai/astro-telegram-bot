@@ -135,10 +135,16 @@ def calculate_synastry(dt_a: str, lat_a: float, lon_a: float, tz_a: str,
 
 # Пример использования
 if __name__ == "__main__":
-    # Тест
-    lat, lon, tz = get_location("Кострома", "Россия")
-    chart = calculate_chart("2002-08-17T15:20", lat, lon, tz)
-    print(f"ASC: {chart['asc']}")
-    print(f"MC: {chart['mc']}")
-    for p in chart['planets']:
-        print(f"{p['name']}: {p['sign']} {round(p['lon'] % 30, 1)}°")
+    import asyncio
+    
+    async def test():
+        # Тест
+        lat, lon, tz = await get_location("Кострома", "Россия")
+        print(f"Координаты: {lat}, {lon}, {tz}")
+        chart = calculate_chart("2002-08-17T15:20", lat, lon, tz)
+        print(f"ASC: {chart['asc']}")
+        print(f"MC: {chart['mc']}")
+        for p in chart['planets']:
+            print(f"{p['name']}: {p['sign']} {round(p['lon'] % 30, 1)}°")
+    
+    asyncio.run(test())
