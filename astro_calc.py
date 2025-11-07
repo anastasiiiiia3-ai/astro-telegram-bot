@@ -83,7 +83,7 @@ def get_sign(lon: float) -> str:
 
 def calculate_chart(dt_str: str, lat: float, lon: float, tz_name: str, house_system: str = "P") -> dict:
     """
-    Рассчитать натальную карту
+    Рассчитать натальную карту (синхронная функция для использования в async контексте)
     house_system: P=Placidus, K=Koch, E=Equal, R=Regiomontanus
     """
     jd = parse_datetime(dt_str, tz_name)
@@ -95,13 +95,13 @@ def calculate_chart(dt_str: str, lat: float, lon: float, tz_name: str, house_sys
     planets_data = []
     for name, planet_id in PLANETS.items():
         pos, ret = swe.calc_ut(jd, planet_id)
-        lon = pos[0]
+        lon_deg = pos[0]
         speed = pos[3]
         
         planets_data.append({
             "name": name,
-            "lon": round(lon, 4),
-            "sign": get_sign(lon),
+            "lon": round(lon_deg, 4),
+            "sign": get_sign(lon_deg),
             "retro": speed < 0
         })
     
