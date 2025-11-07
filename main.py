@@ -488,10 +488,16 @@ async def on_startup():
     """Устанавливаем webhook при запуске"""
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-        await bot.set_webhook(webhook_url, drop_pending_updates=True)
-        print(f"Webhook set to {webhook_url}")
+        try:
+            await bot.set_webhook(webhook_url, drop_pending_updates=True)
+            print(f"✅ Webhook set to {webhook_url}")
+        except Exception as e:
+            print(f"❌ Webhook error: {e}")
+            print("Starting polling instead...")
+            asyncio.create_task(dp.start_polling(bot))
     else:
-        print("WARNING: WEBHOOK_URL not set, bot won't work on Render")
+        print("⚠️ WEBHOOK_URL not set, starting polling mode")
+        asyncio.create_task(dp.start_polling(bot))
 
 @app.on_event("shutdown")
 async def on_shutdown():
