@@ -267,7 +267,7 @@ user_questions = {}
 
 async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
     try:
-        await bot.send_message(chat_id, "⏳ Рассчитываю карту и готовлю интерпретацию...")
+        await bot.send_message(chat_id, "⏳ Рассчитываю карту и готовлю интерпретацию...", parse_mode=None)
         
         if kind == "natal":
             lat, lon, tz = get_location(args["city"], args["country"])
@@ -309,7 +309,10 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             )
             
     except Exception as e:
-        await bot.send_message(chat_id, f"⚠️ Ошибка: {str(e)}\n\nПопробуйте позже или напишите /start")
+        import traceback
+        error_msg = f"⚠️ Ошибка: {str(e)}"
+        print(f"ERROR: {traceback.format_exc()}")
+        await bot.send_message(chat_id, error_msg, parse_mode=None)
 
 # ====== PARSE ======
 def _parse_line(s: str):
@@ -387,8 +390,9 @@ async def natal(m: types.Message):
         arg = m.text.split(" ",1)[1]
         dt, city, country = _parse_line(arg)
     except Exception:
-        return await m.answer("Формат: /natal 17.08.2002, 15:20, Кострома, Россия")
-    await m.answer("✅ Принято! Считаю натальную карту...")
+        return await m.answer("Формат: /natal 17.08.2002, 15:20, Кострома, Россия", parse_mode=None)
+    await m.answer("✅ Принято! Считаю натальную карту...", parse_mode=None)
+    # Запускаем в фоне и не ждём
     asyncio.create_task(build_and_send_pdf(m.chat.id, "natal", {"dt": dt, "city": city, "country": country}))
 
 @dp.message(Command("horary"))
@@ -397,23 +401,23 @@ async def horary(m: types.Message):
         arg = m.text.split(" ",1)[1]
         dt, city, country = _parse_line(arg)
     except Exception:
-        return await m.answer("Формат: /horary 03.11.2025, 19:05, Москва, Россия")
-    await m.answer("✅ Принято! Считаю хорарную карту...")
+        return await m.answer("Формат: /horary 03.11.2025, 19:05, Москва, Россия", parse_mode=None)
+    await m.answer("✅ Принято! Считаю хорарную карту...", parse_mode=None)
     asyncio.create_task(build_and_send_pdf(m.chat.id, "horary", {"dt": dt, "city": city, "country": country}))
 
 @dp.message(Command("synastry"))
 async def synastry(m: types.Message):
     lines = m.text.splitlines()
     if len(lines) < 3:
-        return await m.answer("После /synastry пришлите две строки:\nA: ...\nB: ...")
+        return await m.answer("После /synastry пришлите две строки:\nA: ...\nB: ...", parse_mode=None)
     try:
         a_str = lines[1].split(":",1)[-1].strip()
         b_str = lines[2].split(":",1)[-1].strip()
         dt_a, city_a, country_a = _parse_line(a_str)
         dt_b, city_b, country_b = _parse_line(b_str)
     except Exception:
-        return await m.answer("Пример:\nA: 17.08.2002, 15:20, Кострома, Россия\nB: 04.07.1995, 12:00, Москва, Россия")
-    await m.answer("✅ Принято! Считаю синастрию...")
+        return await m.answer("Пример:\nA: 17.08.2002, 15:20, Кострома, Россия\nB: 04.07.1995, 12:00, Москва, Россия", parse_mode=None)
+    await m.answer("✅ Принято! Считаю синастрию...", parse_mode=None)
     asyncio.create_task(build_and_send_pdf(m.chat.id, "synastry", {
         "a": {"dt": dt_a, "city": city_a, "country": country_a},
         "b": {"dt": dt_b, "city": city_b, "country": country_b}
