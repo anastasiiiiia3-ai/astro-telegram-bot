@@ -37,16 +37,25 @@ SIGNS_RU = [
 ]
 
 # Кеш для геокодинга
-geocoder = Nominatim(user_agent="astro_bot")
+geocoder = Nominatim(user_agent="astro_bot_v2")
 tf = TimezoneFinder()
 
-def get_location(city: str, country: str) -> tuple:
+async def get_location(city: str, country: str) -> tuple:
     """Получить координаты города"""
     try:
-        location = geocoder.geocode(f"{city}, {country}", timeout=10)
+        # Используем синхронный geocoder в executor для async
+        import asyncio
+        loop = asyncio.get_event_loop()
+        location = await loop.run_in_executor(
+            None, 
+            lambda: geocoder.geocode(f"{city}, {country}", timeout=10)
+        )
+        
         if location:
             lat, lon = location.latitude, location.longitude
             tz_name = tf.timezone_at(lat=lat, lng=lon)
+            if not tz_name:
+                tz_name = "UTC"
             return lat, lon, tz_name
         else:
             raise ValueError(f"Город {city}, {country} не найден")
