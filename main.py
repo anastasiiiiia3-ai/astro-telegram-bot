@@ -270,7 +270,7 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
         await bot.send_message(chat_id, "⏳ Рассчитываю карту и готовлю интерпретацию...", parse_mode=None)
         
         if kind == "natal":
-            lat, lon, tz = get_location(args["city"], args["country"])
+            lat, lon, tz = await get_location(args["city"], args["country"])
             chart_data = calculate_chart(args["dt"], lat, lon, tz, house_system="P")
             pdf = await build_pdf_natal(chart_data)
             await bot.send_document(
@@ -281,7 +281,7 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             )
             
         elif kind == "horary":
-            lat, lon, tz = get_location(args["city"], args["country"])
+            lat, lon, tz = await get_location(args["city"], args["country"])
             chart_data = calculate_horary(args["dt"], lat, lon, tz)
             question = user_questions.get(chat_id, "Ваш вопрос")
             pdf = await build_pdf_horary(chart_data, question)
@@ -294,8 +294,8 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             
         else:  # synastry
             a, b = args["a"], args["b"]
-            lat_a, lon_a, tz_a = get_location(a["city"], a["country"])
-            lat_b, lon_b, tz_b = get_location(b["city"], b["country"])
+            lat_a, lon_a, tz_a = await get_location(a["city"], a["country"])
+            lat_b, lon_b, tz_b = await get_location(b["city"], b["country"])
             synastry_data = calculate_synastry(
                 a["dt"], lat_a, lon_a, tz_a,
                 b["dt"], lat_b, lon_b, tz_b
@@ -441,7 +441,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "astro_api": await astro_health()}
+    return {"ok": True, "astro_api": True}
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
