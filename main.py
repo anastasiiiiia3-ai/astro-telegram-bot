@@ -19,9 +19,8 @@ from aiohttp import web
 # ====== ENV ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ASTRO_API = os.getenv("ASTRO_API", "https://astro-ephemeris.onrender.com")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://your-app.onrender.com
-WEBHOOK_PATH = "/webhook/astrohorary"  # Должен совпадать с тем, что Telegram шлёт
+WEBHOOK_PATH = "/webhook/astrohorary"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -35,32 +34,8 @@ app = FastAPI()
 # ====== HTTP CLIENT ======
 client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0, read=90.0))
 
-class EphemerisTemporaryError(Exception):
-    pass
-
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=16),
-    retry=retry_if_exception_type((httpx.TimeoutException, EphemerisTemporaryError)),
-)
-async def astro_post(path: str, json: dict):
-    url = f"{ASTRO_API}{path}"
-    try:
-        r = await client.post(url, json=json)
-    except httpx.TimeoutException:
-        raise
-    if r.status_code >= 500:
-        raise EphemerisTemporaryError(f"{r.status_code} on {url}")
-    r.raise_for_status()
-    return r.json()
-
-async def astro_health() -> bool:
-    try:
-        r = await client.get(f"{ASTRO_API}/health", timeout=3.0)
-        return r.status_code == 200
-    except Exception:
-        return False
+# ====== ASTRO CALCULATIONS (LOCAL) ======
+from astro_calc import get_location, calculate_chart, calculate_horary, calculate_synastry
 
 # ====== OPENAI GPT ======
 async def gpt_interpret(prompt: str, max_tokens: int = 2000) -> str:
@@ -128,19 +103,18 @@ def _table(data: List[List[str]]) -> Table:
     ]))
     return t
 
-async def build_pdf_natal(payload: Dict[str, Any]) -> bytes:
-    chart = payload["chart"]
-    planets = chart.get("planets", [])
-    dt_loc = chart.get("datetime_local", "—")
-    tz = chart.get("iana_tz", "—")
+async def build_pdf_natal(chart_data: Dict[str, Any]) -> bytes:
+    planets = chart_data.get("planets", [])
+    dt_loc = chart_data.get("datetime_local", "—")
+    tz = chart_data.get("iana_tz", "—")
 
     # Формируем промпт для GPT
-    planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'], 1)}°" for p in planets])
+    planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'] % 30, 1)}°" for p in planets])
     gpt_prompt = f"""Проанализируй натальную карту:
 
 Дата: {dt_loc}
-ASC: {chart.get('asc', '—')}
-MC: {chart.get('mc', '—')}
+ASC: {chart_data.get('asc', '—')}
+MC: {chart_data.get('mc', '—')}
 
 Планеты:
 {planets_str}
@@ -165,7 +139,7 @@ MC: {chart.get('mc', '—')}
         Spacer(1, 8)
     ]
     
-    story += [_table([["Элемент","Значение"],["ASC",chart.get("asc","—")],["MC",chart.get("mc","—")]]), Spacer(1, 12)]
+    story += [_table([["Элемент","Значение"],["ASC",chart_data.get("asc","—")],["MC",chart_data.get("mc","—")]]), Spacer(1, 12)]
 
     rows = [["Планета","Долгота","Знак","R"]]
     for p in planets:
@@ -181,18 +155,17 @@ MC: {chart.get('mc', '—')}
     doc.build(story)
     return buf.getvalue()
 
-async def build_pdf_horary(payload: Dict[str, Any], question: str) -> bytes:
-    chart = payload["chart"]
-    planets = chart.get("planets", [])
-    dt_loc = chart.get("datetime_local", "—")
-    tz = chart.get("iana_tz", "—")
+async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
+    planets = chart_data.get("planets", [])
+    dt_loc = chart_data.get("datetime_local", "—")
+    tz = chart_data.get("iana_tz", "—")
 
-    planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'], 1)}°" for p in planets])
+    planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'] % 30, 1)}°" for p in planets])
     gpt_prompt = f"""Проанализируй хорарную карту для вопроса: "{question}"
 
 Момент вопроса: {dt_loc}
-ASC: {chart.get('asc', '—')}
-MC: {chart.get('mc', '—')}
+ASC: {chart_data.get('asc', '—')}
+MC: {chart_data.get('mc', '—')}
 
 Планеты:
 {planets_str}
@@ -216,7 +189,7 @@ MC: {chart.get('mc', '—')}
         Paragraph(f"Вопрос: {question}", styles["HeadRu"]),
         Paragraph(f"Момент: {dt_loc} ({tz})", styles["TextRu"]),
         Spacer(1, 8),
-        _table([["ASC", chart.get("asc","—")], ["MC", chart.get("mc","—")]]),
+        _table([["ASC", chart_data.get("asc","—")], ["MC", chart_data.get("mc","—")]]),
         Spacer(1, 12),
         Paragraph("Ответ", styles["HeadRu"]),
         Paragraph(interpretation.replace('\n', '<br/>'), styles["TextRu"])
@@ -225,11 +198,12 @@ MC: {chart.get('mc', '—')}
     doc.build(story)
     return buf.getvalue()
 
-async def build_pdf_synastry(payload: Dict[str, Any]) -> bytes:
-    da, db = payload["a"], payload["b"]
+async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
+    chart_a = synastry_data["chart_a"]
+    chart_b = synastry_data["chart_b"]
     
-    planets_a = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in da["chart"].get("planets", [])])
-    planets_b = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in db["chart"].get("planets", [])])
+    planets_a = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in chart_a.get("planets", [])])
+    planets_b = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in chart_b.get("planets", [])])
     
     gpt_prompt = f"""Проанализируй синастрию двух людей:
 
@@ -264,10 +238,6 @@ async def build_pdf_synastry(payload: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 # ====== LOGIC ======
-async def resolve_place(city: str, country: str) -> Tuple[float, float, str]:
-    data = await astro_post("/api/resolve", {"city": city, "country": country})
-    return float(data["lat"]), float(data["lon"]), str(data["iana_tz"])
-
 def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
     """Кнопки допродаж после получения результата"""
     buttons = []
@@ -300,12 +270,9 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
         await bot.send_message(chat_id, "⏳ Рассчитываю карту и готовлю интерпретацию...")
         
         if kind == "natal":
-            lat, lon, tz = await resolve_place(args["city"], args["country"])
-            data = await astro_post("/api/chart", {
-                "datetime_local": args["dt"], "lat": lat, "lon": lon,
-                "iana_tz": tz, "house_system": "Placidus"
-            })
-            pdf = await build_pdf_natal(data)
+            lat, lon, tz = get_location(args["city"], args["country"])
+            chart_data = calculate_chart(args["dt"], lat, lon, tz, house_system="P")
+            pdf = await build_pdf_natal(chart_data)
             await bot.send_document(
                 chat_id, 
                 types.BufferedInputFile(pdf, "natal.pdf"), 
@@ -314,13 +281,10 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             )
             
         elif kind == "horary":
-            lat, lon, tz = await resolve_place(args["city"], args["country"])
-            data = await astro_post("/api/horary", {
-                "datetime_local": args["dt"], "lat": lat, "lon": lon,
-                "iana_tz": tz, "house_system": "Regiomontanus"
-            })
+            lat, lon, tz = get_location(args["city"], args["country"])
+            chart_data = calculate_horary(args["dt"], lat, lon, tz)
             question = user_questions.get(chat_id, "Ваш вопрос")
-            pdf = await build_pdf_horary(data, question)
+            pdf = await build_pdf_horary(chart_data, question)
             await bot.send_document(
                 chat_id, 
                 types.BufferedInputFile(pdf, "horary.pdf"), 
@@ -330,11 +294,13 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             
         else:  # synastry
             a, b = args["a"], args["b"]
-            lat_a, lon_a, tz_a = await resolve_place(a["city"], a["country"])
-            lat_b, lon_b, tz_b = await resolve_place(b["city"], b["country"])
-            da = await astro_post("/api/chart", {"datetime_local": a["dt"], "lat": lat_a, "lon": lon_a, "iana_tz": tz_a, "house_system": "Placidus"})
-            db = await astro_post("/api/chart", {"datetime_local": b["dt"], "lat": lat_b, "lon": lon_b, "iana_tz": tz_b, "house_system": "Placidus"})
-            pdf = await build_pdf_synastry({"a": da, "b": db})
+            lat_a, lon_a, tz_a = get_location(a["city"], a["country"])
+            lat_b, lon_b, tz_b = get_location(b["city"], b["country"])
+            synastry_data = calculate_synastry(
+                a["dt"], lat_a, lon_a, tz_a,
+                b["dt"], lat_b, lon_b, tz_b
+            )
+            pdf = await build_pdf_synastry(synastry_data)
             await bot.send_document(
                 chat_id, 
                 types.BufferedInputFile(pdf, "synastry.pdf"), 
