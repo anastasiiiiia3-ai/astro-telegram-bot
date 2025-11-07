@@ -2,17 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Библиотеки для reportlab (PDF)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libfreetype6 libjpeg62-turbo zlib1g \
- && rm -rf /var/lib/apt/lists/*
-
+# Копируем requirements.txt и устанавливаем зависимости
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Копируем весь код проекта
 COPY . .
 
-ENV PORT=10000
-EXPOSE 10000
+# ВАЖНО: Копируем файл шрифта в контейнер
+COPY DejaVuSans.ttf /app/DejaVuSans.ttf
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Указываем команду запуска
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
