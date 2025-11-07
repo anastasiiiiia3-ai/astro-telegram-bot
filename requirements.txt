@@ -6,3 +6,7 @@ tenacity==9.0.0
 pydantic==2.5.3
 reportlab==4.2.2
 aiohttp==3.9.1
+pyswisseph==2.10.3.2
+timezonefinder==6.5.2
+pytz==2024.1
+geopy==2.4.1
