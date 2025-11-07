@@ -1,10 +1,9 @@
 import os
 import io
 import asyncio
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -13,8 +12,12 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib import colors
 
 # ====== ENV ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -22,45 +25,31 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://your-app.onrender.com
 WEBHOOK_PATH = "/webhook/astrohorary"
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    raise RuntimeError("TELEGRAM_TOKEN или OPENAI_API_KEY не установлены")
 
 bot = Bot(TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 app = FastAPI()
-
-# ====== HTTP CLIENT ======
-client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0, read=90.0))
+client = httpx.AsyncClient(timeout=90)
 
 # ====== ASTRO CALCULATIONS (LOCAL) ======
 from astro_calc import get_location, calculate_chart, calculate_horary, calculate_synastry
 
-# ====== OPENAI GPT ======
+# ====== GPT INTERPRETATION ======
 async def gpt_interpret(prompt: str, max_tokens: int = 2000) -> str:
-    """Получить интерпретацию от ChatGPT"""
     try:
         response = await client.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4o-mini",  # или gpt-4o для лучшего качества
+                "model": "gpt-4o-mini",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "Ты профессиональный астролог с 15-летним опытом. "
-                                   "Твои интерпретации тёплые, понятные, без перегруза терминами. "
-                                   "Фокус на практической пользе и поддержке человека. "
-                                   "Пиши на русском языке."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system",
+                     "content": "Ты профессиональный астролог с 15-летним опытом. "
+                                "Твои интерпретации тёплые, понятные, без перегруза терминами. "
+                                "Пиши на русском."},
+                    {"role": "user", "content": prompt}
                 ],
                 "max_tokens": max_tokens,
                 "temperature": 0.7
@@ -70,31 +59,19 @@ async def gpt_interpret(prompt: str, max_tokens: int = 2000) -> str:
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"⚠️ Не удалось получить интерпретацию: {str(e)}"
+        return f"⚠️ Не удалось получить интерпретацию: {e}"
 
-# ====== PDF ======
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib import colors
-
-try:
-    pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
-except Exception:
-    pass
+# ====== PDF STYLES ======
 
 styles = getSampleStyleSheet()
-styles.add(ParagraphStyle(name="TitleRu", fontName="DejaVu", fontSize=18, leading=22, alignment=TA_CENTER, spaceAfter=12))
-styles.add(ParagraphStyle(name="HeadRu", fontName="DejaVu", fontSize=12, leading=16, alignment=TA_LEFT, spaceBefore=8, spaceAfter=6))
-styles.add(ParagraphStyle(name="TextRu", fontName="DejaVu", fontSize=11, leading=16, alignment=TA_LEFT, spaceAfter=6))
+styles.add(ParagraphStyle(name="TitleRu", fontName="Helvetica", fontSize=18, leading=22, alignment=TA_CENTER, spaceAfter=12))
+styles.add(ParagraphStyle(name="HeadRu", fontName="Helvetica", fontSize=12, leading=16, alignment=TA_LEFT, spaceBefore=8, spaceAfter=6))
+styles.add(ParagraphStyle(name="TextRu", fontName="Helvetica", fontSize=11, leading=16, alignment=TA_LEFT, spaceAfter=6))
 
 def _table(data: List[List[str]]) -> Table:
     t = Table(data, hAlign="LEFT")
     t.setStyle(TableStyle([
-        ("FONTNAME", (0,0), (-1,-1), "DejaVu"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 10),
         ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
@@ -108,9 +85,8 @@ async def build_pdf_natal(chart_data: Dict[str, Any]) -> bytes:
     dt_loc = chart_data.get("datetime_local", "—")
     tz = chart_data.get("iana_tz", "—")
 
-    # Формируем промпт для GPT
     planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'] % 30, 1)}°" for p in planets])
-    gpt_prompt = f"""Проанализируй натальную карту:
+    prompt = f"""Проанализируй натальную карту:
 
 Дата: {dt_loc}
 ASC: {chart_data.get('asc', '—')}
@@ -127,31 +103,21 @@ MC: {chart_data.get('mc', '—')}
 
 Пиши понятно и по-человечески, избегай сложных терминов."""
 
-    interpretation = await gpt_interpret(gpt_prompt, max_tokens=3000)
-
+    interpretation = await gpt_interpret(prompt, max_tokens=3000)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    story: List[Any] = []
-
-    story += [
+    story = [
         Paragraph("Натальная карта (Placidus)", styles["TitleRu"]),
         Paragraph(f"Дата и время: {dt_loc} ({tz})", styles["TextRu"]),
-        Spacer(1, 8)
+        Spacer(1, 8),
+        _table([["Элемент","Значение"],["ASC",chart_data.get("asc","—")],["MC",chart_data.get("mc","—")]]),
+        Spacer(1, 12)
     ]
-    
-    story += [_table([["Элемент","Значение"],["ASC",chart_data.get("asc","—")],["MC",chart_data.get("mc","—")]]), Spacer(1, 12)]
-
     rows = [["Планета","Долгота","Знак","R"]]
     for p in planets:
         rows.append([p["name"], f"{round(p['lon'],2)}°", p.get("sign","—"), "R" if p.get("retro") else ""])
     story += [Paragraph("Планеты", styles["HeadRu"]), _table(rows), PageBreak()]
-
-    # Добавляем интерпретацию от GPT
-    story += [
-        Paragraph("Интерпретация", styles["HeadRu"]),
-        Paragraph(interpretation.replace('\n', '<br/>'), styles["TextRu"])
-    ]
-
+    story += [Paragraph("Интерпретация", styles["HeadRu"]), Paragraph(interpretation.replace('\n', '<br/>'), styles["TextRu"])]
     doc.build(story)
     return buf.getvalue()
 
@@ -159,9 +125,9 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
     planets = chart_data.get("planets", [])
     dt_loc = chart_data.get("datetime_local", "—")
     tz = chart_data.get("iana_tz", "—")
-
     planets_str = "\n".join([f"{p['name']}: {p.get('sign', '?')} {round(p['lon'] % 30, 1)}°" for p in planets])
-    gpt_prompt = f"""Проанализируй хорарную карту для вопроса: "{question}"
+
+    prompt = f"""Проанализируй хорарную карту для вопроса: "{question}"
 
 Момент вопроса: {dt_loc}
 ASC: {chart_data.get('asc', '—')}
@@ -178,13 +144,10 @@ MC: {chart_data.get('mc', '—')}
 
 Пиши ясно и конкретно."""
 
-    interpretation = await gpt_interpret(gpt_prompt, max_tokens=2000)
-
+    interpretation = await gpt_interpret(prompt, max_tokens=2000)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    story = []
-    
-    story += [
+    story = [
         Paragraph("Хорарная карта (Regiomontanus)", styles["TitleRu"]),
         Paragraph(f"Вопрос: {question}", styles["HeadRu"]),
         Paragraph(f"Момент: {dt_loc} ({tz})", styles["TextRu"]),
@@ -194,18 +157,17 @@ MC: {chart_data.get('mc', '—')}
         Paragraph("Ответ", styles["HeadRu"]),
         Paragraph(interpretation.replace('\n', '<br/>'), styles["TextRu"])
     ]
-    
     doc.build(story)
     return buf.getvalue()
 
 async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
     chart_a = synastry_data["chart_a"]
     chart_b = synastry_data["chart_b"]
-    
+
     planets_a = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in chart_a.get("planets", [])])
     planets_b = "\n".join([f"{p['name']}: {p.get('sign', '?')}" for p in chart_b.get("planets", [])])
-    
-    gpt_prompt = f"""Проанализируй синастрию двух людей:
+
+    prompt = f"""Проанализируй синастрию двух людей:
 
 Карта A:
 {planets_a}
@@ -221,27 +183,21 @@ async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
 
 Пиши тепло и практично."""
 
-    interpretation = await gpt_interpret(gpt_prompt, max_tokens=2500)
-
+    interpretation = await gpt_interpret(prompt, max_tokens=2500)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
-    story = []
-    
-    story += [
+    story = [
         Paragraph("Синастрия", styles["TitleRu"]),
         Paragraph("Анализ совместимости", styles["HeadRu"]),
         Spacer(1, 8),
         Paragraph(interpretation.replace('\n', '<br/>'), styles["TextRu"])
     ]
-    
     doc.build(story)
     return buf.getvalue()
 
-# ====== LOGIC ======
+# ====== Логика кнопок допродаж ======
 def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
-    """Кнопки допродаж после получения результата"""
     buttons = []
-    
     if service_type == "horary":
         buttons = [
             [InlineKeyboardButton(text="🔮 Ещё один вопрос (300₽)", callback_data="buy_horary")],
@@ -259,62 +215,40 @@ def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Транзиты для отношений (500₽)", callback_data="buy_transits_synastry")],
             [InlineKeyboardButton(text="⭐ Композитная карта (600₽)", callback_data="buy_composite")]
         ]
-    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Словарь для хранения вопросов пользователей (в продакшене использовать БД)
 user_questions = {}
 
 async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
     try:
         await bot.send_message(chat_id, "⏳ Рассчитываю карту и готовлю интерпретацию...", parse_mode=None)
-        
+
         if kind == "natal":
             lat, lon, tz = await get_location(args["city"], args["country"])
-            chart_data = calculate_chart(args["dt"], lat, lon, tz, house_system="P")
-            pdf = await build_pdf_natal(chart_data)
-            await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "natal.pdf"), 
-                caption="✨ Ваша натальная карта готова!\n\nХотите узнать больше?",
-                reply_markup=upsell_keyboard("natal")
-            )
-            
+            chart = calculate_chart(args["dt"], lat, lon, tz, house_system="P")
+            pdf = await build_pdf_natal(chart)
+            await bot.send_document(chat_id, types.BufferedInputFile(pdf, "natal.pdf"), caption="✨ Ваша натальная карта готова!\n\nХотите узнать больше?", reply_markup=upsell_keyboard("natal"))
+
         elif kind == "horary":
             lat, lon, tz = await get_location(args["city"], args["country"])
-            chart_data = calculate_horary(args["dt"], lat, lon, tz)
+            chart = calculate_horary(args["dt"], lat, lon, tz)
             question = user_questions.get(chat_id, "Ваш вопрос")
-            pdf = await build_pdf_horary(chart_data, question)
-            await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "horary.pdf"), 
-                caption="🔮 Ответ на ваш вопрос готов!\n\nЧто ещё вас интересует?",
-                reply_markup=upsell_keyboard("horary")
-            )
-            
+            pdf = await build_pdf_horary(chart, question)
+            await bot.send_document(chat_id, types.BufferedInputFile(pdf, "horary.pdf"), caption="🔮 Ответ на ваш вопрос готов!\n\nЧто ещё вас интересует?", reply_markup=upsell_keyboard("horary"))
+
         else:  # synastry
             a, b = args["a"], args["b"]
             lat_a, lon_a, tz_a = await get_location(a["city"], a["country"])
             lat_b, lon_b, tz_b = await get_location(b["city"], b["country"])
-            synastry_data = calculate_synastry(
-                a["dt"], lat_a, lon_a, tz_a,
-                b["dt"], lat_b, lon_b, tz_b
-            )
-            pdf = await build_pdf_synastry(synastry_data)
-            await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "synastry.pdf"), 
-                caption="💑 Анализ совместимости готов!\n\nХотите углубиться?",
-                reply_markup=upsell_keyboard("synastry")
-            )
-            
+            syn = calculate_synastry(a["dt"], lat_a, lon_a, tz_a, b["dt"], lat_b, lon_b, tz_b)
+            pdf = await build_pdf_synastry(syn)
+            await bot.send_document(chat_id, types.BufferedInputFile(pdf, "synastry.pdf"), caption="💑 Анализ совместимости готов!\n\nХотите углубиться?", reply_markup=upsell_keyboard("synastry"))
+
     except Exception as e:
         import traceback
-        error_msg = f"⚠️ Ошибка: {str(e)}"
-        print(f"ERROR: {traceback.format_exc()}")
-        await bot.send_message(chat_id, error_msg, parse_mode=None)
+        print(traceback.format_exc())
+        await bot.send_message(chat_id, f"⚠️ Ошибка: {e}")
 
-# ====== PARSE ======
 def _parse_line(s: str):
     parts = [p.strip() for p in s.split(",")]
     if len(parts) < 4:
@@ -323,7 +257,6 @@ def _parse_line(s: str):
     dt = f"{yy}-{mm.zfill(2)}-{dd.zfill(2)}T{parts[1]}"
     return dt, parts[2], ",".join(parts[3:])
 
-# ====== HANDLERS ======
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -331,56 +264,45 @@ async def cmd_start(m: types.Message):
         [InlineKeyboardButton(text="🔮 Хорарный вопрос", callback_data="info_horary")],
         [InlineKeyboardButton(text="💑 Синастрия (совместимость)", callback_data="info_synastry")],
     ])
-    
-    await m.answer(
-        "Привет! 🌟\n\n"
-        "Я астролог-бот с искусственным интеллектом. "
-        "Помогу разобраться в натальной карте, ответить на хорарные вопросы и посмотреть совместимость.\n\n"
-        "Выбери услугу:",
-        reply_markup=keyboard
-    )
+    await m.answer("Привет! Я астролог-бот с ИИ.\nВыберите услугу:", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data.startswith("info_"))
 async def info_callback(callback: types.CallbackQuery):
     service = callback.data.replace("info_", "")
-    
-    if service == "natal":
-        text = (
+    texts = {
+        "natal": (
             "⭐ <b>Натальная карта</b>\n\n"
-            "Получите подробный разбор вашей личности, талантов и жизненного пути.\n\n"
-            "📝 Формат: /natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
-            "Пример: /natal 17.08.2002, 15:20, Кострома, Россия\n\n"
-            "💰 Стоимость: 1000₽"
-        )
-    elif service == "horary":
-        text = (
+            "Получите подробный разбор личности и жизненного пути.\n"
+            "Формат: /natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
+            "Пример: /natal 17.08.2002, 15:20, Кострома, Россия\n"
+            "Стоимость: 1000₽"
+        ),
+        "horary": (
             "🔮 <b>Хорарный вопрос</b>\n\n"
-            "Задайте конкретный вопрос и получите астрологический ответ.\n\n"
-            "📝 Формат:\n"
+            "Задайте вопрос и получите астрологический ответ.\n"
+            "Формат:\n"
             "1. Напишите вопрос\n"
-            "2. /horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n\n"
+            "2. /horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
             "Пример:\n"
             "Стоит ли менять работу?\n"
-            "/horary 07.11.2025, 14:30, Москва, Россия\n\n"
-            "💰 Стоимость: 300₽"
-        )
-    else:  # synastry
-        text = (
+            "/horary 07.11.2025, 14:30, Москва, Россия\n"
+            "Стоимость: 300₽"
+        ),
+        "synastry": (
             "💑 <b>Синастрия</b>\n\n"
-            "Анализ совместимости двух людей.\n\n"
-            "📝 Формат:\n"
+            "Анализ совместимости двух людей.\n"
+            "Формат:\n"
             "/synastry\n"
             "A: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
-            "B: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n\n"
-            "💰 Стоимость: 900₽"
+            "B: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
+            "Стоимость: 900₽"
         )
-    
-    await callback.message.answer(text)
+    }
+    await callback.message.answer(texts.get(service, "Неизвестная услуга"))
     await callback.answer()
 
 @dp.message(lambda m: m.text and not m.text.startswith("/"))
 async def save_question(m: types.Message):
-    """Сохраняем вопрос пользователя для хорара"""
     user_questions[m.chat.id] = m.text
     await m.answer("Вопрос принят! Теперь отправьте данные для расчёта:\n/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
 
@@ -390,9 +312,8 @@ async def natal(m: types.Message):
         arg = m.text.split(" ",1)[1]
         dt, city, country = _parse_line(arg)
     except Exception:
-        return await m.answer("Формат: /natal 17.08.2002, 15:20, Кострома, Россия", parse_mode=None)
-    await m.answer("✅ Принято! Считаю натальную карту...", parse_mode=None)
-    # Запускаем в фоне и не ждём
+        return await m.answer("Формат: /natal 17.08.2002, 15:20, Кострома, Россия")
+    await m.answer("✅ Принято! Считаю натальную карту...")
     asyncio.create_task(build_and_send_pdf(m.chat.id, "natal", {"dt": dt, "city": city, "country": country}))
 
 @dp.message(Command("horary"))
@@ -401,23 +322,23 @@ async def horary(m: types.Message):
         arg = m.text.split(" ",1)[1]
         dt, city, country = _parse_line(arg)
     except Exception:
-        return await m.answer("Формат: /horary 03.11.2025, 19:05, Москва, Россия", parse_mode=None)
-    await m.answer("✅ Принято! Считаю хорарную карту...", parse_mode=None)
+        return await m.answer("Формат: /horary 03.11.2025, 19:05, Москва, Россия")
+    await m.answer("✅ Принято! Считаю хорарную карту...")
     asyncio.create_task(build_and_send_pdf(m.chat.id, "horary", {"dt": dt, "city": city, "country": country}))
 
 @dp.message(Command("synastry"))
 async def synastry(m: types.Message):
     lines = m.text.splitlines()
     if len(lines) < 3:
-        return await m.answer("После /synastry пришлите две строки:\nA: ...\nB: ...", parse_mode=None)
+        return await m.answer("После /synastry пришлите две строки:\nA: ...\nB: ...")
     try:
         a_str = lines[1].split(":",1)[-1].strip()
         b_str = lines[2].split(":",1)[-1].strip()
         dt_a, city_a, country_a = _parse_line(a_str)
         dt_b, city_b, country_b = _parse_line(b_str)
     except Exception:
-        return await m.answer("Пример:\nA: 17.08.2002, 15:20, Кострома, Россия\nB: 04.07.1995, 12:00, Москва, Россия", parse_mode=None)
-    await m.answer("✅ Принято! Считаю синастрию...", parse_mode=None)
+        return await m.answer("Пример:\nA: 17.08.2002, 15:20, Кострома, Россия\nB: 04.07.1995, 12:00, Москва, Россия")
+    await m.answer("✅ Принято! Считаю синастрию...")
     asyncio.create_task(build_and_send_pdf(m.chat.id, "synastry", {
         "a": {"dt": dt_a, "city": city_a, "country": country_a},
         "b": {"dt": dt_b, "city": city_b, "country": country_b}
@@ -425,27 +346,20 @@ async def synastry(m: types.Message):
 
 @dp.callback_query(lambda c: c.data.startswith("buy_"))
 async def handle_purchase(callback: types.CallbackQuery):
-    """Обработка нажатия кнопок допродаж"""
     service = callback.data.replace("buy_", "")
-    
-    # Здесь будет интеграция с платежами
-    await callback.message.answer(
-        f"🛒 Отлично! Для покупки услуги '{service}' напишите @your_username или используйте /pay_{service}"
-    )
+    await callback.message.answer(f"🛒 Для покупки услуги '{service}' напишите @your_username или используйте соответствующую команду.")
     await callback.answer()
 
-# ====== FASTAPI + WEBHOOK ======
 @app.get("/")
 async def root():
     return PlainTextResponse("Astro Bot is running")
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "astro_api": True}
+    return {"ok": True}
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """Обработка webhook от Telegram"""
     try:
         update = types.Update(**await request.json())
         await dp.feed_update(bot, update)
@@ -455,17 +369,14 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
-    """Устанавливаем webhook при запуске"""
-    # ВСЕГДА сначала удаляем старый webhook
     await bot.delete_webhook(drop_pending_updates=True)
     print("🗑️ Старый webhook удалён")
-    
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
         try:
             await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            webhook_info = await bot.get_webhook_info()
-            print(f"✅ Webhook установлен: {webhook_info.url}")
+            info = await bot.get_webhook_info()
+            print(f"✅ Webhook установлен: {info.url}")
         except Exception as e:
             print(f"❌ Ошибка webhook: {e}")
             print("⚠️ Запускаю polling...")
