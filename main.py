@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib import colors
 
 from reportlab.pdfbase.ttfonts import TTFont
@@ -30,7 +30,7 @@ except Exception as e:
     print(f"❌ Ошибка регистрации шрифта: {e}")
     raise
 
-# ====== ENV ======
+# ====== ENVIRONMENT VARIABLES ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
@@ -44,15 +44,17 @@ dp = Dispatcher()
 app = FastAPI()
 client = httpx.AsyncClient(timeout=120)
 
-# ====== ASTRO ======
+# ====== ASTRO CALCULATION MODULE ======
 from astro_calc import get_location, calculate_chart, calculate_horary, calculate_synastry
 
-# ====== Утилита для разбивки на абзацы ======
+# ====== UTILS ======
 def split_into_paragraphs(text: str) -> List[str]:
-    paras = [p.strip() for p in text.split('\n\n') if p.strip()]
-    return paras
+    return [p.strip() for p in text.split('\n\n') if p.strip()]
 
-# ====== GPT ======
+def paragraph_flowables(text: str) -> List[Paragraph]:
+    return [Paragraph(p, styles["TextRu"]) for p in split_into_paragraphs(text)]
+
+# ====== GPT INTERPRETATION ======
 async def gpt_interpret(prompt: str, max_tokens: int = 3000) -> str:
     try:
         resp = await client.post(
@@ -66,7 +68,7 @@ async def gpt_interpret(prompt: str, max_tokens: int = 3000) -> str:
                 "messages": [
                     {"role": "system",
                      "content": "Ты профессиональный астролог с 15-летним опытом. "
-                                "Пиши понятным, простым языком, избегай сложной терминологии."},
+                                "Пиши простым, понятным языком, избегай сложной терминологии."},
                     {"role": "user", "content": prompt}
                 ],
                 "max_tokens": max_tokens,
@@ -79,7 +81,7 @@ async def gpt_interpret(prompt: str, max_tokens: int = 3000) -> str:
     except Exception:
         return "⚠️ Не удалось получить интерпретацию. Попробуйте позже."
 
-# ====== PDF СТИЛИ ======
+# ====== PDF STYLE ======
 styles = getSampleStyleSheet()
 styles.add(ParagraphStyle(name="TitleRu", fontName="DejaVuSans", fontSize=20, leading=24,
                           alignment=TA_CENTER, spaceAfter=20, textColor=colors.HexColor("#2c3e50")))
@@ -90,9 +92,7 @@ styles.add(ParagraphStyle(name="TextRu", fontName="DejaVuSans", fontSize=11, lea
 styles.add(ParagraphStyle(name="IntroRu", fontName="DejaVuSans", fontSize=11, leading=14,
                           alignment=TA_CENTER, spaceAfter=15, textColor=colors.grey))
 
-def paragraph_flowables(text: str) -> List[Paragraph]:
-    paras = split_into_paragraphs(text)
-    return [Paragraph(p, styles["TextRu"]) for p in paras]
+# ====== PDF BUILDERS ======
 
 async def build_pdf_natal(chart_data: Dict[str, Any]) -> bytes:
     dt_raw = chart_data.get("datetime_local", "—")
@@ -107,14 +107,12 @@ async def build_pdf_natal(chart_data: Dict[str, Any]) -> bytes:
     location_str = f"{city}, {country}"
     header_line = f"Дата и время рождения: {dt_str}\nМесто рождения: {location_str}"
 
-    # Текст уточняющий точность расчетов
     official_data_note = (
         "Обратите внимание: я не просто чат-бот на базе GPT. "
         "Все мои расчёты основаны на данных официальных астрологических сервисов, "
         "поэтому результаты максимально точные и надёжные."
     )
 
-    # Тут можно вставить ваши старые промпты или новые упрощённые, сокращу ради примера
     prompt = f"""Дата рождения: {dt_str}
 Место рождения: {location_str}
 
@@ -153,18 +151,14 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
     location_str = f"{city}, {country}"
     header_line = f"Дата и время вопроса: {dt_str}\nМесто нахождения: {location_str}"
 
-    examples_text = (
-        "Примеры популярных вопросов для хорарной астрологии:\n"
-        "- Будет ли успешным моё новое дело?\n"
-        "- Как сложатся отношения с этим человеком?\n"
-        "- Какая перспектива по здоровью в ближайшее время?\n"
-    )
-
     prompt = f"""Вопрос: "{question}"
 Дата и время вопроса: {dt_str}
 Место нахождения: {location_str}
 
-Дай чёткий и простой ответ, избегая астрологических терминов. Объясни основную суть и дай практические рекомендации."""
+Дай развёрнутый, плавный и понятный ответ на вопрос, избегая терминов планет, домов, аспектов.
+Объясни, что в карте есть указатели, которые показывают ситуацию, и постепенно раскрой суть.
+Начни с основного вывода, затем расскажи детали, потом дай рекомендации для действий.
+Пиши дружелюбно и емко."""
 
     interpretation = await gpt_interpret(prompt, 1500)
 
@@ -175,10 +169,8 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
 
     story.append(Paragraph("ХОРАРНЫЙ ВОПРОС", styles["TitleRu"]))
     story.append(Paragraph(header_line, styles["IntroRu"]))
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Описание", styles["SectionRu"]))
-    story.append(Paragraph(examples_text, styles["TextRu"]))
-    story.append(Spacer(1, 16))
+    story.append(Spacer(1, 18))
+
     story.append(Paragraph("Ответ астролога", styles["SectionRu"]))
     story.extend(paragraph_flowables(interpretation))
 
@@ -204,7 +196,7 @@ async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
     doc.build(story)
     return buf.getvalue()
 
-# ====== КНОПКИ ======
+# ====== INLINE KEYBOARD ======
 def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
     buttons = []
     if service_type == "horary":
@@ -225,7 +217,6 @@ def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
         ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 user_questions: Dict[int, str] = {}
 
 async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
@@ -233,7 +224,6 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
         await bot.send_message(chat_id, "⏳ Готовлю анализ... Это займёт около минуты.", parse_mode=None)
 
         if kind == "horary":
-            # Проверяем есть ли вопрос
             question = user_questions.get(chat_id)
             if not question or question.strip() == "":
                 await bot.send_message(chat_id, "⚠️ Пожалуйста, сначала отправьте мне ваш вопрос текстом, а затем команду /horary с датой и местом.")
@@ -249,7 +239,6 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
                 caption="🔮 Ответ на ваш вопрос готов!",
                 reply_markup=upsell_keyboard("horary")
             )
-            # Очистим вопрос после ответа
             user_questions.pop(chat_id, None)
             return
 
@@ -284,7 +273,7 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
     except Exception as e:
         import traceback
         print(traceback.format_exc())
-        await bot.send_message(chat_id, "⚠️ Ошибка при создании анализа. Попробуйте еще раз позже.")
+        await bot.send_message(chat_id, "⚠️ Ошибка при создании анализа. Попробуйте ещё раз позже.")
 
 def _parse_line(s: str):
     parts = [p.strip() for p in s.split(",")]
@@ -315,13 +304,13 @@ async def cmd_start(m: types.Message):
     ])
     await m.answer(
         "Привет! 👋\n\n"
-        "Я астролог-бот на базе GPT, но моя сила в том, что я получаю данные с официальных астрологических сервисов.\n"
-        "Это гарантирует высокую точность расчётов и интерпретаций.\n\n"
+        "Я астролог-бот на базе GPT, но мои расчёты основаны на официальных астрологических сервисах, "
+        "что гарантирует высокую точность.\n\n"
         "Доступные услуги:\n"
-        "- Натальная карта: подробный разбор вашей личности\n"
+        "- Натальная карта: подробный разбор\n"
         "- Хорарный вопрос: ответ на конкретный вопрос (сначала задайте вопрос, потом дату и место)\n"
-        "- Синастрия: анализ совместимости пары\n\n"
-        "Выберите интересующую услугу:",
+        "- Синастрия: совместимость пары\n\n"
+        "Выберите услугу:",
         reply_markup=keyboard
     )
 
@@ -336,18 +325,17 @@ async def info_callback(callback: types.CallbackQuery):
             "/natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
             "Пример:\n"
             "/natal 17.08.2002, 15:20, Кострома, Россия\n\n"
-            "🔎 Важно: мои расчёты основаны на официальных сервисах, "
-            "поэтому точность очень высокая."
+            "🔎 Мои расчёты основаны на официальных сервисах, точность гарантирована."
         ),
         "horary": (
             "🔮 <b>Хорарный вопрос (100₽)</b>\n"
-            "Получите ответ на конкретный вопрос из разных сфер жизни.\n"
-            "Сначала отправьте вопрос обычным сообщением, затем используйте команду с датой и местом.\n\n"
-            "Популярные примеры вопросов:\n"
-            "- Будет ли успешным моё новое дело?\n"
-            "- Как сложатся отношения с этим человеком?\n"
-            "- Какое здоровье меня ожидает в ближайшее время?\n\n"
-            "Команда для заказа:\n"
+            "Получите ответ на конкретный вопрос.\n"
+            "Примеры:\n"
+            "- Заработаю ли я денег в новом проекте?\n"
+            "- Сложатся ли у меня отношения с Васей?\n"
+            "- Вернут ли мне долг?\n\n"
+            "Сначала отправьте вопрос, затем используйте команду с датой и местом.\n"
+            "Формат:\n"
             "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
             "Пример:\n"
             "/horary 07.11.2025, 14:30, Москва, Россия"
@@ -431,6 +419,7 @@ async def handle_purchase(callback: types.CallbackQuery):
     await callback.answer()
 
 # ====== FASTAPI ======
+
 @app.get("/")
 async def root():
     return PlainTextResponse("Astro Bot is running")
