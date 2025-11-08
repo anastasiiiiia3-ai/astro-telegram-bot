@@ -1,12 +1,9 @@
 import os
 import io
 import asyncio
-from typing import Dict, List
+from typing import Dict, Any
 
 import httpx
-
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -22,202 +19,268 @@ from reportlab.lib import colors
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 
-# Регистрация шрифта DejaVuSans
+# Регистрация шрифта
 try:
-    pdfmetrics.registerFont(TTFont("DejaVuSans", "/app/DejaVuSans.ttf"))
+    pdfmetrics.registerFont(TTFont("DejaVuSans", "DejaVuSans.ttf"))
 except Exception as e:
     print(f"Ошибка регистрации шрифта: {e}")
     raise
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_PATH = "/webhook/astrohorary"
 
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("TELEGRAM_TOKEN и OPENAI_API_KEY обязательны")
+    raise RuntimeError("TELEGRAM_TOKEN и OPENAI_API_KEY необходимы")
 
-bot = Bot(TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-app = FastAPI()
 client = httpx.AsyncClient(timeout=120)
-
-# Здесь импортируйте свои astro_calc реализованные функции:
-# from astro_calc import get_location, calculate_chart, calculate_horary, calculate_synastry
-
-
-def split_paragraphs(text: str) -> List[str]:
-    return [p.strip() for p in text.split("\n\n") if p.strip()]
-
-
-def paragraphs_to_flowables(text: str) -> List[Paragraph]:
-    return [Paragraph(p, styles["TextRu"]) for p in split_paragraphs(text)]
-
 
 styles = getSampleStyleSheet()
 styles.add(ParagraphStyle("TitleRu", fontName="DejaVuSans", fontSize=20, alignment=TA_CENTER, spaceAfter=20, textColor=colors.HexColor("#2c3e50")))
 styles.add(ParagraphStyle("SectionRu", fontName="DejaVuSans", fontSize=14, alignment=TA_LEFT, spaceBefore=16, spaceAfter=10, textColor=colors.HexColor("#34495e")))
 styles.add(ParagraphStyle("TextRu", fontName="DejaVuSans", fontSize=11, leading=16, alignment=TA_JUSTIFY, spaceAfter=10))
-styles.add(ParagraphStyle("IntroRu", fontName="DejaVuSans", fontSize=11, alignment=TA_CENTER, spaceAfter=15, textColor=colors.grey))
-
-
-async def gpt_interpret(question: str, max_tokens=1000) -> str:
-    system_msg = (
-        "Ты профессиональный астролог с 15-летним опытом. "
-        "Ответь четко и коротко.\n"
-        "Формат: 1) краткий ответ Да/Нет или похожий вариант, 2) 2-3 пункта объяснения, 3) краткий совет.\n"
-        "Не используй астрологические термины. Текст на русском."
-    )
-    try:
-        response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": question}
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
-        )
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "⚠️ Не удалось получить ответ. Попробуйте позже."
-
-
-async def gpt_followup_question(question: str) -> str:
-    prompt = (
-        f"Пользователь спросил: \"{question}\".\n"
-        "Придумай один конкретный уточняющий вопрос, логично связанный и полезный для дальнейшего анализа.\n"
-        "Ответь коротко, начинай с \"Хотите узнать:\" и сам вопрос."
-    )
-    try:
-        response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": "Ты опытный астролог, который умеет задавать полезные уточняющие вопросы."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 60,
-                "temperature": 0.7,
-            },
-        )
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "Хотите узнать более подробную информацию по вашему вопросу?"
-
+styles.add(ParagraphStyle("IntroRu", fontName="DejaVuSans", fontSize=11, alignment=TA_CENTER, spaceAfter=15, textColor=colors.gray))
 
 user_questions: Dict[int, str] = {}
 
+# Вспомогательная функция для разделения текста на параграфы
+def paragraphs_to_flowables(text: str):
+    paras = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return [Paragraph(p, styles["TextRu"]) for p in paras]
 
-@dp.message(lambda m: m.text and not m.text.startswith("/"))
-async def capture_question(message: types.Message):
-    user_questions[message.chat.id] = message.text.strip()
-    await message.answer(
-        "✅ Вопрос принят!\n"
-        "Теперь отправьте команду с датой, временем и местом, например:\n"
-        "/horary 08.11.2025, 14:30, Москва, Россия"
+# Простой вызов OpenAI для интерпретаций с заданным system prompt
+async def openai_request(system_prompt: str, user_prompt: str, max_tokens: int = 3000) -> str:
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+    try:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json=body
+        )
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"OpenAI request failed: {e}")
+        return "⚠️ Ошибка при получении интерпретации. Попробуйте позже."
+
+# Функция построения PDF для натальной карты
+async def build_pdf_natal(datetime_str: str, city: str, country: str) -> bytes:
+    system_prompt = (
+        "Ты профессиональный астролог с 15-летним опытом. "
+        "Опиши характеристику человека по дате и месту рождения простым языком, без сложной астрологической терминологии."
     )
+    user_prompt = f"Дата рождения: {datetime_str}, Место: {city}, {country}.\nДай подробный разбор личности."
+    interpretation = await openai_request(system_prompt, user_prompt, max_tokens=3000)
 
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60, topMargin=50, bottomMargin=50)
+    story = [
+        Paragraph("НАТАЛЬНАЯ КАРТА", styles["TitleRu"]),
+        Paragraph(f"Дата рождения и время: {datetime_str}", styles["IntroRu"]),
+        Paragraph(f"Место рождения: {city}, {country}", styles["IntroRu"]),
+        Spacer(1, 14),
+    ]
+    story.extend(paragraphs_to_flowables(interpretation))
+    doc.build(story)
+    return buf.getvalue()
+
+# Функция построения PDF для хорарного вопроса
+async def build_pdf_horary(datetime_str: str, city: str, country: str, question: str) -> bytes:
+    system_prompt = (
+        "Ты опытный астролог. Ответь четко и коротко: да/нет/скорее да или нет.\n"
+        "Разъясни 2-3 пункта, затем дай краткий совет. Без терминов.\n"
+        "В конце предложи 1 уточняющий вопрос по теме, который пользователь мог бы задать."
+    )
+    user_prompt = (
+        f"Дата вопроса: {datetime_str}, Место: {city}, {country}.\n"
+        f"Вопрос: {question}\n"
+        "Ответь и предложи уточняющий вопрос."
+    )
+    response = await openai_request(system_prompt, user_prompt, max_tokens=1000)
+    # Ожидаем, что модель вернёт ответ + уточняющий вопрос (можно разделять по разделителю, но для простоты выводим всё в PDF)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60, topMargin=50, bottomMargin=50)
+    story = [
+        Paragraph("ХОРАРНЫЙ ВОПРОС", styles["TitleRu"]),
+        Paragraph(f"Дата и время вопроса: {datetime_str}", styles["IntroRu"]),
+        Paragraph(f"Место: {city}, {country}", styles["IntroRu"]),
+        Spacer(1, 14),
+        Paragraph("Ответ:", styles["SectionRu"]),
+    ]
+    story.extend(paragraphs_to_flowables(response))
+    doc.build(story)
+    return buf.getvalue()
+
+# Функция построения PDF для синастрии
+async def build_pdf_synastry(datetime_a: str, city_a: str, country_a: str,
+                             datetime_b: str, city_b: str, country_b: str) -> bytes:
+    system_prompt = (
+        "Ты опытный астролог. Опиши совместимость пары, их сильные и слабые стороны, возможные сложности и советы для гармоничных отношений.\n"
+        "Пиши простым, понятным языком."
+    )
+    user_prompt = (
+        f"Человек A: дата рождения и время {datetime_a}, место {city_a}, {country_a}.\n"
+        f"Человек B: дата рождения и время {datetime_b}, место {city_b}, {country_b}.\n"
+        "Дай подробный разбор совместимости."
+    )
+    interpretation = await openai_request(system_prompt, user_prompt, max_tokens=3000)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60, topMargin=50, bottomMargin=50)
+    story = [
+        Paragraph("СИНАСТРИЯ — АНАЛИЗ СОВМЕСТИМОСТИ", styles["TitleRu"]),
+        Spacer(1, 14),
+    ]
+    story.extend(paragraphs_to_flowables(interpretation))
+    doc.build(story)
+    return buf.getvalue()
 
 def parse_date_place(arg: str):
     parts = [p.strip() for p in arg.split(",")]
     if len(parts) < 4:
-        raise ValueError("Неверный формат даты и места")
+        raise ValueError("Неверный формат. Требуется: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
     dd, mm, yyyy = parts[0].split(".")
     dt = f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}T{parts[1]}"
     city = parts[2]
     country = ",".join(parts[3:]).strip()
     return dt, city, country
 
+def parse_synastry(text: str):
+    lines = [line.strip() for line in text.strip().splitlines()]
+    a_line = next((l for l in lines if l.startswith("A:")), None)
+    b_line = next((l for l in lines if l.startswith("B:")), None)
+    if not a_line or not b_line:
+        raise ValueError("Для синастрии нужны строки с A: и B:")
+    a_data = a_line[2:].strip()
+    b_data = b_line[2:].strip()
+    dt_a, city_a, country_a = parse_date_place(a_data)
+    dt_b, city_b, country_b = parse_date_place(b_data)
+    return dt_a, city_a, country_a, dt_b, city_b, country_b
 
-async def build_pdf_horary(dt: str, city: str, country: str, question: str) -> bytes:
-    from datetime import datetime
-
-    try:
-        dt_obj = datetime.fromisoformat(dt)
-        dt_str = dt_obj.strftime("%H:%M, %d.%m.%Y")
-    except Exception:
-        dt_str = dt
-
-    header = f"Дата и время вопроса: {dt_str}\nМесто: {city}, {country}"
-
-    answer_text = await gpt_interpret(question)
-    followup = await gpt_followup_question(question)
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=50, bottomMargin=50,
-                            leftMargin=60, rightMargin=60)
-    story = [
-        Paragraph("Хорарный вопрос", styles["TitleRu"]),
-        Paragraph(header, styles["IntroRu"]),
-        Spacer(1, 12),
-        Paragraph("Ответ:", styles["SectionRu"]),
-    ] + paragraphs_to_flowables(answer_text) + [
-        Spacer(1, 20),
-        Paragraph("Дополнительный вопрос:", styles["SectionRu"]),
-        Paragraph(followup, styles["TextRu"]),
-    ]
-    doc.build(story)
-    return buf.getvalue()
-
+@dp.message(lambda m: m.text and not m.text.startswith("/"))
+async def store_user_question(message: types.Message):
+    user_questions[message.chat.id] = message.text.strip()
+    await message.answer(
+        "Вопрос сохранён.\n"
+        "Теперь используйте одну из команд:\n"
+        "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна — хорарный вопрос\n"
+        "/natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна — натальная карта\n"
+        "/synastry\nA: дата, время, город, страна\nB: дата, время, город, страна — синастрия\n\n"
+        "Примеры хорарных вопросов:\n"
+        "- Вернется ли ко мне Вася?\n"
+        "- Будет ли повышение?\n"
+        "- Удастся ли продать квартиру?\n"
+    )
 
 @dp.message(Command("horary"))
-async def horary_command(message: types.Message):
+async def cmd_horary(message: types.Message):
     if message.chat.id not in user_questions:
-        await message.answer(
-            "❗ Сначала отправьте мне ваш вопрос обычным сообщением.\n"
-            "Затем используйте команду /horary с датой, временем и местом.\n"
-            "Пример:\n"
-            "/horary 08.11.2025, 14:30, Москва, Россия"
-        )
+        await message.answer("Сначала отправьте ваш вопрос сообщением.")
         return
-
     try:
         arg = message.text.split(" ", 1)[1]
         dt, city, country = parse_date_place(arg)
     except Exception:
-        await message.answer("❌ Некорректный формат команды. Используйте:\n/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+        await message.answer("Неверный формат команды. Используйте:\n/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
         return
+    dt_str = datetime.fromisoformat(dt).strftime("%H:%M, %d.%m.%Y")
+    await message.answer("Готовлю ответ. Пожалуйста, подождите.")
+    pdf = await build_pdf_horary(dt_str, city, country, user_questions[message.chat.id])
+    await bot.send_document(message.chat.id, types.InputFile(io.BytesIO(pdf), "horary_answer.pdf"))
+    user_questions.pop(message.chat.id)
 
-    await message.answer("⏳ Обработка вашего вопроса... Это может занять минуту.")
-    pdf = await build_pdf_horary(dt, city, country, user_questions[message.chat.id])
-    await bot.send_document(message.chat.id, types.BufferedInputFile(pdf, "horary_answer.pdf"), caption="Ответ на ваш вопрос")
-    del user_questions[message.chat.id]
+@dp.message(Command("natal"))
+async def cmd_natal(message: types.Message):
+    try:
+        arg = message.text.split(" ", 1)[1]
+        dt, city, country = parse_date_place(arg)
+    except Exception:
+        await message.answer("Неверный формат команды. Используйте:\n/natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна")
+        return
+    dt_str = datetime.fromisoformat(dt).strftime("%H:%M, %d.%m.%Y")
+    await message.answer("Готовлю натальную карту. Пожалуйста, подождите.")
+    pdf = await build_pdf_natal(dt_str, city, country)
+    await bot.send_document(message.chat.id, types.InputFile(io.BytesIO(pdf), "natal_chart.pdf"))
 
+@dp.message(Command("synastry"))
+async def cmd_synastry(message: types.Message):
+    try:
+        payload = message.text.partition("\n")[2]
+        dt_a, city_a, country_a, dt_b, city_b, country_b = parse_synastry(payload)
+    except Exception:
+        await message.answer(
+            "Неверный формат команды.\n"
+            "Используйте:\n"
+            "/synastry\n"
+            "A: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n"
+            "B: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+        )
+        return
+    await message.answer("Готовлю анализ совместимости. Пожалуйста, подождите.")
+    pdf = await build_pdf_synastry(dt_a, city_a, country_a, dt_b, city_b, country_b)
+    await bot.send_document(message.chat.id, types.InputFile(io.BytesIO(pdf), "synastry.pdf"))
 
 @dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+async def cmd_start(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("🔮 Хорарный вопрос (100₽)", callback_data="info_horary")],
+        [InlineKeyboardButton("⭐ Натальная карта (300₽)", callback_data="info_natal")],
+        [InlineKeyboardButton("💑 Синастрия (300₽)", callback_data="info_synastry")]
     ])
     await message.answer(
-        "Привет! Отправьте ваш вопрос обычным сообщением, а затем используйте команду /horary с датой, временем и местом.\n\n"
-        "Пример команды:\n/horary 08.11.2025, 14:30, Москва, Россия",
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(lambda c: c.data == "info_horary")
-async def info_horary_callback(callback: types.CallbackQuery):
-    await callback.message.answer(
-        "🔮 Хорарный вопрос (100₽)\n\n"
-        "Примеры вопросов:\n"
+        "Привет! Отправьте ваш вопрос обычным сообщением,\n"
+        "затем используйте одну из команд:\n"
+        "• /horary — для хорарного вопроса\n"
+        "• /natal — для натальной карты\n"
+        "• /synastry — для анализа совместимости пары\n\n"
+        "Примеры хорарных вопросов:\n"
         "- Вернется ли ко мне Вася?\n"
-        "- Удастся ли получить повышение?\n"
-        "- Будут ли деньги в этом проекте?\n\n"
-        "Сначала напишите свой вопрос простым сообщением, потом пришлите команду с датой, временем и местом:\n"
-        "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
-    )
-    await callback.answer()
+        "- Будет ли повышение на работе?\n"
+        "- Сложатся ли отношения с этим человеком?\n\n"
+        "Выберите услугу ниже:", reply_markup=kb)
 
+@dp.callback_query(lambda c: c.data.startswith("info_"))
+async def callback_info(c: types.CallbackQuery):
+    service = c.data.replace("info_", "")
+    texts = {
+        "horary": (
+            "🔮 <b>Хорарный вопрос</b>\n\n"
+            "Задайте конкретный вопрос, например:\n"
+            "- Вернется ли ко мне Вася?\n"
+            "- Удастся ли получить повышение?\n"
+            "- Будут ли деньги с проекта?\n\n"
+            "После отправки вопроса используйте команду:\n"
+            "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+        ),
+        "natal": (
+            "⭐ <b>Натальная карта</b>\n\n"
+            "Детальный анализ личности.\n"
+            "Команда:\n"
+            "/natal ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+        ),
+        "synastry": (
+            "💑 <b>Синастрия</b>\n\n"
+            "Анализ совместимости пары.\n"
+            "Команда:\n"
+            "/synastry\nA: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\nB: ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна"
+        )
+    }
+    await c.message.answer(texts.get(service, "Информация отсутствует."))
+    await c.answer()
+
+async def main():
+    print("Бот запускается в polling режиме...")
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    asyncio.run(main())
