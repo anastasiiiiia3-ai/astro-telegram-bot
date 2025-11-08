@@ -47,6 +47,12 @@ client = httpx.AsyncClient(timeout=120)
 # ====== ASTRO ======
 from astro_calc import get_location, calculate_chart, calculate_horary, calculate_synastry
 
+# ====== Утилита для разбивки на абзацы ======
+def split_into_paragraphs(text: str) -> List[str]:
+    # Разбиваем по парам переводов строк, игнорируем пустые
+    paras = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return paras
+
 # ====== GPT ======
 async def gpt_interpret(prompt: str, max_tokens: int = 3000) -> str:
     try:
@@ -66,123 +72,129 @@ async def gpt_interpret(prompt: str, max_tokens: int = 3000) -> str:
         )
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"К сожалению, не удалось получить интерпретацию. Пожалуйста, попробуйте позже."
+    except Exception:
+        return "К сожалению, не удалось получить интерпретацию. Пожалуйста, попробуйте позже."
 
 # ====== PDF СТИЛИ ======
 styles = getSampleStyleSheet()
 styles.add(ParagraphStyle(name="TitleRu", fontName="DejaVuSans", fontSize=20, leading=24, alignment=TA_CENTER, spaceAfter=20, textColor=colors.HexColor("#2c3e50")))
 styles.add(ParagraphStyle(name="SectionRu", fontName="DejaVuSans", fontSize=14, leading=18, alignment=TA_LEFT, spaceBefore=16, spaceAfter=10, textColor=colors.HexColor("#34495e"), bold=True))
 styles.add(ParagraphStyle(name="TextRu", fontName="DejaVuSans", fontSize=11, leading=16, alignment=TA_JUSTIFY, spaceAfter=10))
-styles.add(ParagraphStyle(name="IntroRu", fontName="DejaVuSans", fontSize=10, leading=14, alignment=TA_CENTER, spaceAfter=12, textColor=colors.grey))
+styles.add(ParagraphStyle(name="IntroRu", fontName="DejaVuSans", fontSize=11, leading=14, alignment=TA_CENTER, spaceAfter=15, textColor=colors.grey))
+
+def paragraph_flowables(text: str) -> List[Paragraph]:
+    paras = split_into_paragraphs(text)
+    return [Paragraph(p, styles["TextRu"]) for p in paras]
 
 async def build_pdf_natal(chart_data: Dict[str, Any]) -> bytes:
-    dt_loc = chart_data.get("datetime_local", "—")
-    
-    # Промпты для разных разделов
-    prompt_overview = f"""Дата рождения: {dt_loc}
+    # Формируем понятную строку с датой и местом
+    dt_raw = chart_data.get("datetime_local", "—")
+    city = chart_data.get("city", "—")
+    country = chart_data.get("country", "—")
+    # Ожидаемая строка примерно '2025-11-08T12:34:00'
+    # Переформатируем для читаемого вывода
+    try:
+        from datetime import datetime
+        dt_obj = datetime.fromisoformat(dt_raw)
+        dt_str = dt_obj.strftime("%H:%M, %d.%m.%Y")
+    except Exception:
+        dt_str = dt_raw
 
-Напиши краткую общую характеристику личности человека, родившегося в это время. Расскажи о его основных качествах, жизненном пути и предназначении. 
+    location_str = f"{city}, {country}"
+    header_line = f"Дата и время рождения: {dt_str}\nМесто рождения: {location_str}"
 
-Пиши простым языком, БЕЗ упоминания планет, знаков зодиака, домов и аспектов. Только понятные характеристики личности."""
+    # Промпты как раньше, без решёток, простой язык
+    prompt_overview = f"""Дата рождения: {dt_str}
+Место рождения: {location_str}
 
-    prompt_love = f"""Дата рождения: {dt_loc}
+Опиши общую характеристику личности, основные качества, жизненный путь и предназначение простыми словами. Избегай технических терминов и перечислений планет, домов или знаков."""
 
-Опиши подробно тему любви и отношений для этого человека:
-- Как он проявляется в отношениях
-- Какой партнер ему подходит
-- Склонность к браку и количество возможных браков
-- Особенности в интимной сфере
-- Советы для гармоничных отношений
+    prompt_love = f"""Дата рождения: {dt_str}
+Место рождения: {location_str}
 
-Пиши простым языком, понятно обычному человеку, БЕЗ астрологических терминов."""
+Расскажи про любовь и отношения: как человек проявляется в чувствах, каким партнёр подходит, особенности в близких отношениях, советы для гармонии. Пиши простым языком."""
 
-    prompt_career = f"""Дата рождения: {dt_loc}
+    prompt_career = f"""Дата рождения: {dt_str}
+Место рождения: {location_str}
 
-Проанализируй карьеру и финансовую сферу:
-- В каких профессиях человек будет успешен
-- Какие таланты помогут в работе
-- Отношение к деньгам и финансовое благополучие
-- Возможные сложности в карьере
-- Рекомендации для профессионального роста
+Опиши карьеру и финансы: в каких сферах человек успешен, таланты, отношение к деньгам и советы для роста. Простой и понятный язык."""
 
-Пиши простым языком, без технических астрологических деталей."""
+    prompt_health = f"""Дата рождения: {dt_str}
+Место рождения: {location_str}
 
-    prompt_health = f"""Дата рождения: {dt_loc}
+Расскажи про здоровье и образ жизни: на что обратить внимание, рекомендуемый образ жизни, общие советы. Пиши понятно, без медицинских терминов."""
 
-Расскажи о здоровье и образе жизни:
-- На что обратить внимание в здоровье
-- Какой образ жизни подходит
-- Рекомендации по поддержанию здоровья
-- Психологическое состояние и эмоции
+    prompt_growth = f"""Дата рождения: {dt_str}
+Место рождения: {location_str}
 
-Пиши понятно, без медицинских диагнозов, только общие рекомендации."""
+Дай советы для личностного роста: что развивать, на что обращать внимание, как раскрыть потенциал. Пиши вдохновляюще и понятно."""
 
-    prompt_growth = f"""Дата рождения: {dt_loc}
-
-Дай практические рекомендации для личностного развития:
-- Какие качества развивать
-- Какие ловушки и слабости учитывать
-- Как раскрыть свой потенциал
-- Духовное развитие и жизненные уроки
-
-Пиши вдохновляюще и понятно."""
-
-    # Генерация интерпретаций
     overview = await gpt_interpret(prompt_overview, 800)
     love = await gpt_interpret(prompt_love, 900)
     career = await gpt_interpret(prompt_career, 900)
     health = await gpt_interpret(prompt_health, 700)
     growth = await gpt_interpret(prompt_growth, 700)
 
-    # Создание PDF
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=50, bottomMargin=50, leftMargin=60, rightMargin=60)
     story = []
 
     story.append(Paragraph("НАТАЛЬНАЯ КАРТА", styles["TitleRu"]))
-    story.append(Paragraph(f"Составлена {dt_loc}", styles["IntroRu"]))
-    story.append(Spacer(1, 20))
+    story.append(Paragraph(header_line, styles["IntroRu"]))
+    story.append(Spacer(1, 12))
 
     story.append(Paragraph("Общая характеристика личности", styles["SectionRu"]))
-    story.append(Paragraph(overview, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.extend(paragraph_flowables(overview))
 
     story.append(PageBreak())
     story.append(Paragraph("Любовь и отношения", styles["SectionRu"]))
-    story.append(Paragraph(love, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.extend(paragraph_flowables(love))
 
     story.append(PageBreak())
     story.append(Paragraph("Карьера и финансы", styles["SectionRu"]))
-    story.append(Paragraph(career, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.extend(paragraph_flowables(career))
 
     story.append(PageBreak())
     story.append(Paragraph("Здоровье и образ жизни", styles["SectionRu"]))
-    story.append(Paragraph(health, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.extend(paragraph_flowables(health))
 
     story.append(PageBreak())
     story.append(Paragraph("Рекомендации для развития", styles["SectionRu"]))
-    story.append(Paragraph(growth, styles["TextRu"]))
+    story.extend(paragraph_flowables(growth))
 
     doc.build(story)
     return buf.getvalue()
 
+
 async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
-    dt_loc = chart_data.get("datetime_local", "—")
+    # Для хорарной карты берем дату и город где задают вопрос, не рождения
+    dt_raw = chart_data.get("datetime_local", "—")
+    city = chart_data.get("city", "—")
+    country = chart_data.get("country", "—")
+    try:
+        from datetime import datetime
+        dt_obj = datetime.fromisoformat(dt_raw)
+        dt_str = dt_obj.strftime("%H:%M, %d.%m.%Y")
+    except Exception:
+        dt_str = dt_raw
+    location_str = f"{city}, {country}"
+    header_line = f"Дата и время вопроса: {dt_str}\nМесто нахождения: {location_str}"
 
-    prompt = f"""Хорарный вопрос: "{question}"
-Момент вопроса: {dt_loc}
+    examples_text = (
+        "Примеры вопросов, которые вы можете задать:\n"
+        "- Договорится ли бизнес-партнёрство?\n"
+        "- Как сложится ситуация с работой в ближайшие месяцы?\n"
+        "- Стоит ли принимать это предложение?\n"
+        "- Когда будет лучшее время для важных решений?\n\n"
+        "Важно: в командах указывайте дату и время момент задавания вопроса, " 
+        "а также место, где вы находитесь в этот момент, а не дату рождения."
+    )
 
-Дай чёткий ответ на этот вопрос:
-1. Прямой ответ (да/нет/зависит от условий)
-2. Объяснение ситуации простыми словами
-3. Что повлияет на исход
-4. Практические советы и действия
+    prompt = f"""Вопрос: "{question}"
+Дата и время вопроса: {dt_str}
+Место нахождения: {location_str}
 
-Пиши понятно, БЕЗ упоминания планет, домов и аспектов. Как мудрый советчик."""
+Дай чёткий и простой ответ на этот вопрос, избегая сложной астрологической терминологии. Объясни основную суть и дай практические советы."""
 
     interpretation = await gpt_interpret(prompt, 1500)
 
@@ -190,51 +202,39 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=50, bottomMargin=50, leftMargin=60, rightMargin=60)
     story = []
 
-    story.append(Paragraph("ХОРАРНЫЙ ОТВЕТ", styles["TitleRu"]))
-    story.append(Paragraph(f"Вопрос задан {dt_loc}", styles["IntroRu"]))
-    story.append(Spacer(1, 20))
-
-    story.append(Paragraph(f"Ваш вопрос: {question}", styles["SectionRu"]))
+    story.append(Paragraph("ХОРАРНЫЙ ВОПРОС", styles["TitleRu"]))
+    story.append(Paragraph(header_line, styles["IntroRu"]))
     story.append(Spacer(1, 12))
-    story.append(Paragraph(interpretation, styles["TextRu"]))
+    story.append(Paragraph("Описание", styles["SectionRu"]))
+    for p in split_into_paragraphs(examples_text):
+        story.append(Paragraph(p, styles["TextRu"]))
+        story.append(Spacer(1, 6))
+
+    story.append(Spacer(1, 16))
+    story.append(Paragraph("Ответ астролога", styles["SectionRu"]))
+    story.extend(paragraph_flowables(interpretation))
 
     doc.build(story)
     return buf.getvalue()
 
+
 async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
-    
-    prompt_overview = """Проанализируй совместимость двух людей.
-
-Дай общую оценку отношений:
-- Насколько они подходят друг другу
-- Главные притягательные качества
-- Общая энергетика пары
-
-Пиши простым языком, понятно и тепло."""
-
-    prompt_harmony = """Опиши зоны гармонии в отношениях:
-- Что объединяет партнеров
-- В чем они дополняют друг друга
-- Какие сферы будут благоприятными
-- Радости и удовольствия в паре
-
-Пиши позитивно и вдохновляюще."""
-
-    prompt_challenges = """Опиши возможные сложности и конфликты:
-- Зоны напряжения
-- Что может вызывать разногласия
-- Как преодолевать трудности
-- Уроки для роста пары
-
-Пиши конструктивно, с акцентом на развитие."""
-
-    prompt_advice = """Дай практические советы для улучшения отношений:
-- Как лучше взаимодействовать
-- На что обратить внимание
-- Как укрепить связь
-- Прогноз развития отношений
-
-Пиши мудро и с теплотой."""
+    prompt_overview = (
+        "Оцените совместимость двух людей, расскажите, насколько они подходят друг другу, "
+        "какие у них сильные стороны в отношениях, и дайте понятные советы для гармонии. "
+        "Избегайте астрологических терминов."
+    )
+    prompt_harmony = (
+        "Опишите, что объединяет эту пару, какие у них взаимные плюсы, "
+        "и что приносит радость в их общении."
+    )
+    prompt_challenges = (
+        "Расскажите о сложностях, которые могут возникать, и как их лучше решать "
+        "для благополучия пары."
+    )
+    prompt_advice = (
+        "Дайте конкретные практические рекомендации для улучшения отношений и их укрепления."
+    )
 
     overview = await gpt_interpret(prompt_overview, 800)
     harmony = await gpt_interpret(prompt_harmony, 900)
@@ -246,26 +246,22 @@ async def build_pdf_synastry(synastry_data: Dict[str, Any]) -> bytes:
     story = []
 
     story.append(Paragraph("АНАЛИЗ СОВМЕСТИМОСТИ", styles["TitleRu"]))
-    story.append(Paragraph("Синастрия отношений", styles["IntroRu"]))
-    story.append(Spacer(1, 20))
+    story.append(Spacer(1, 10))
 
     story.append(Paragraph("Общая совместимость", styles["SectionRu"]))
-    story.append(Paragraph(overview, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.extend(paragraph_flowables(overview))
 
     story.append(PageBreak())
-    story.append(Paragraph("Гармоничные аспекты", styles["SectionRu"]))
-    story.append(Paragraph(harmony, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("Гармоничные стороны отношений", styles["SectionRu"]))
+    story.extend(paragraph_flowables(harmony))
 
     story.append(PageBreak())
-    story.append(Paragraph("Зоны роста и вызовы", styles["SectionRu"]))
-    story.append(Paragraph(challenges, styles["TextRu"]))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("Сложности и вызовы", styles["SectionRu"]))
+    story.extend(paragraph_flowables(challenges))
 
     story.append(PageBreak())
     story.append(Paragraph("Рекомендации для пары", styles["SectionRu"]))
-    story.append(Paragraph(advice, styles["TextRu"]))
+    story.extend(paragraph_flowables(advice))
 
     doc.build(story)
     return buf.getvalue()
@@ -281,8 +277,8 @@ def upsell_keyboard(service_type: str) -> InlineKeyboardMarkup:
         ]
     elif service_type == "natal":
         buttons = [
-            [InlineKeyboardButton(text="💑 Синастрия с партнёром (300₽)", callback_data="buy_synastry")],
-            [InlineKeyboardButton(text="🔮 Задать хорарный вопрос (100₽)", callback_data="buy_horary")]
+            [InlineKeyboardButton(text="💑 Синастрия (300₽)", callback_data="buy_synastry")],
+            [InlineKeyboardButton(text="🔮 Хорарный вопрос (100₽)", callback_data="buy_horary")]
         ]
     else:
         buttons = [
@@ -299,11 +295,14 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
 
         if kind == "natal":
             lat, lon, tz = await get_location(args["city"], args["country"])
+            # Добавляем в chart_data город и страну для отображения
             chart = calculate_chart(args["dt"], lat, lon, tz, house_system="P")
+            chart["city"] = args["city"]
+            chart["country"] = args["country"]
             pdf = await build_pdf_natal(chart)
             await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "natalnaya_karta.pdf"), 
+                chat_id,
+                types.BufferedInputFile(pdf, "natalnaya_karta.pdf"),
                 caption="✨ Ваша натальная карта готова!\n\nЭто подробный анализ вашей личности, отношений, карьеры и жизненного пути.",
                 reply_markup=upsell_keyboard("natal")
             )
@@ -311,11 +310,13 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
         elif kind == "horary":
             lat, lon, tz = await get_location(args["city"], args["country"])
             chart = calculate_horary(args["dt"], lat, lon, tz)
+            chart["city"] = args["city"]
+            chart["country"] = args["country"]
             question = user_questions.get(chat_id, "Ваш вопрос")
             pdf = await build_pdf_horary(chart, question)
             await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "horarny_otvet.pdf"), 
+                chat_id,
+                types.BufferedInputFile(pdf, "horarny_otvet.pdf"),
                 caption="🔮 Ответ на ваш вопрос готов!",
                 reply_markup=upsell_keyboard("horary")
             )
@@ -327,8 +328,8 @@ async def build_and_send_pdf(chat_id: int, kind: str, args: Dict[str, Any]):
             syn = calculate_synastry(a["dt"], lat_a, lon_a, tz_a, b["dt"], lat_b, lon_b, tz_b)
             pdf = await build_pdf_synastry(syn)
             await bot.send_document(
-                chat_id, 
-                types.BufferedInputFile(pdf, "sinastriya.pdf"), 
+                chat_id,
+                types.BufferedInputFile(pdf, "sinastriya.pdf"),
                 caption="💑 Анализ вашей совместимости готов!",
                 reply_markup=upsell_keyboard("synastry")
             )
@@ -387,7 +388,8 @@ async def info_callback(callback: types.CallbackQuery):
             "• Прямой ответ да/нет\n"
             "• Объяснение ситуации\n"
             "• Практические советы\n\n"
-            "Сначала напишите свой вопрос, затем используйте команду с датой и местом.\n\n"
+            "Сначала напишите свой вопрос, затем используйте команду с датой и местом.\n"
+            "При указании даты и места учитывайте момент задавания вопроса, а не дату рождения.\n\n"
             "<b>Формат:</b>\n"
             "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n\n"
             "<b>Пример:</b>\n"
@@ -418,7 +420,7 @@ async def save_question(m: types.Message):
     user_questions[m.chat.id] = m.text
     await m.answer(
         "✅ Вопрос принят!\n\n"
-        "Теперь отправьте данные для расчёта:\n"
+        "Теперь отправьте дату, время и место задавания вопроса:\n"
         "/horary ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна\n\n"
         "Например:\n"
         "/horary 08.11.2025, 12:00, Москва, Россия"
