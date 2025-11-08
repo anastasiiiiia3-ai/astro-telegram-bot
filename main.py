@@ -155,12 +155,27 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
 Дата и время вопроса: {dt_str}
 Место нахождения: {location_str}
 
-Дай развёрнутый, плавный и понятный ответ на вопрос, избегая терминов планет, домов, аспектов.
-Объясни, что в карте есть указатели, которые показывают ситуацию, и постепенно раскрой суть.
-Начни с основного вывода, затем расскажи детали, потом дай рекомендации для действий.
-Пиши дружелюбно и емко."""
+Ответь чётко и конкретно — да или нет, без лишней воды. 
+Затем кратко уточни детали и обстоятельства, влияющие на ответ. 
+Пиши коротко и понятно, избегай размытых формулировок и астрологических терминов.
 
-    interpretation = await gpt_interpret(prompt, 1500)
+В конце предложи один дополнительный уточняющий вопрос, который логично следует из этого ответа и который пользователь сможет задать за отдельную плату."""
+
+    interpretation = await gpt_interpret(prompt, 1000)
+
+    # Разбиваем ответ на основной текст и уточняющий вопрос (если возможно)
+    # Для простоты — предложим взять последнюю строку ответа как дополнительный вопрос после разделителя "Вопрос для уточнения:"
+    # Если деления нет, просто добавим стандартную фразу.
+
+    additional_question = ""
+    main_text = interpretation
+    if "Вопрос для уточнения:" in interpretation:
+        parts = interpretation.split("Вопрос для уточнения:")
+        main_text = parts[0].strip()
+        additional_question = parts[1].strip()
+    else:
+        # Если нет явного предложения, добавим стандартное
+        additional_question = "Хотите, можем уточнить вопрос подробнее, чтобы дать более точный совет?"
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=50, bottomMargin=50,
@@ -171,8 +186,12 @@ async def build_pdf_horary(chart_data: Dict[str, Any], question: str) -> bytes:
     story.append(Paragraph(header_line, styles["IntroRu"]))
     story.append(Spacer(1, 18))
 
-    story.append(Paragraph("Ответ астролога", styles["SectionRu"]))
-    story.extend(paragraph_flowables(interpretation))
+    story.append(Paragraph("Ответ", styles["SectionRu"]))
+    story.extend(paragraph_flowables(main_text))
+
+    story.append(Spacer(1, 20))
+    story.append(Paragraph("Дополнительный вопрос", styles["SectionRu"]))
+    story.append(Paragraph(additional_question, styles["TextRu"]))
 
     doc.build(story)
     return buf.getvalue()
