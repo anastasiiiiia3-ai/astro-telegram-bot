@@ -2,15 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Копируем requirements.txt и устанавливаем зависимости
+# Установка системных зависимостей для geopy и других пакетов
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем requirements и устанавливаем зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь код проекта
+# Копируем все файлы проекта
 COPY . .
 
-# ВАЖНО: Копируем файл шрифта в контейнер
-COPY DejaVuSans.ttf /app/DejaVuSans.ttf
+# Проверяем наличие шрифта
+RUN ls -la DejaVuSans.ttf || echo "WARNING: Font file not found"
 
-# Указываем команду запуска
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Запускаем бота (НЕ FastAPI!)
+CMD ["python", "main.py"]
