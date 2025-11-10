@@ -3,6 +3,7 @@ import io
 import asyncio
 from typing import Dict
 from datetime import datetime
+from aiohttp import web
 
 import httpx
 from aiogram import Bot, Dispatcher, types, F
@@ -294,7 +295,7 @@ async def horary_question_handler(message: types.Message, state: FSMContext):
         "<code>ДД.ММ.ГГГГ, ЧЧ:ММ, Город, Страна</code>\n\n"
         "Пример:\n<code>10.11.2025, 14:30, Москва, Россия</code>"
     )
-    await state.set_state(UserStates.waiting_natal_data)  # Переиспользуем для даты
+    await state.set_state(UserStates.waiting_natal_data)
 
 @dp.message(UserStates.waiting_natal_data)
 async def natal_data_handler(message: types.Message, state: FSMContext):
@@ -305,7 +306,6 @@ async def natal_data_handler(message: types.Message, state: FSMContext):
         user_data[uid]["city"] = city
         user_data[uid]["country"] = country
         
-        # Показываем кнопку оплаты
         service_type = user_data[uid]["service"]
         price_info = PRICES.get(service_type, PRICES["horary"])
         
@@ -369,12 +369,10 @@ async def payment_handler(callback: types.CallbackQuery):
     price_info = PRICES[service]
     
     if not PAYMENT_TOKEN:
-        # Режим без оплаты (для тестирования)
         await callback.answer("⚠️ Оплата отключена, обработка бесплатно...")
         await process_service(callback.from_user.id, callback.message)
         return
     
-    # Отправка счета
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title=price_info["title"],
@@ -414,13 +412,9 @@ async def process_service(user_id: int, message: types.Message):
 async def process_horary(user_id: int, message: types.Message):
     data = user_data[user_id]
     
-    # Получаем координаты
     lat, lon, tz = await get_location(data["city"], data["country"])
-    
-    # Рассчитываем хорарную карту
     chart = calculate_horary(data["datetime"], lat, lon, tz)
     
-    # Отправляем в GPT с реальными данными
     system_prompt = (
         "Ты опытный хорарный астролог. Проанализируй карту и дай:\n"
         "1) Четкий ответ: Да/Нет/Скорее да/Скорее нет\n"
@@ -435,17 +429,14 @@ async def process_horary(user_id: int, message: types.Message):
     
     answer = await openai_request(system_prompt, user_prompt, max_tokens=1200)
     
-    # Создаем PDF
     pdf = await build_pdf_horary(chart, data["question"], answer)
     
-    # Отправляем
     await bot.send_document(
         user_id,
         types.BufferedInputFile(pdf, "horary.pdf"),
         caption="🔮 Ваш хорарный ответ готов!"
     )
     
-    # Предлагаем еще вопрос
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Задать еще вопрос 🔮", callback_data="service_horary")
     ]])
@@ -511,11 +502,33 @@ async def process_synastry(user_id: int, message: types.Message):
         caption="💑 Анализ совместимости готов!"
     )
 
+# ===== ВЕБ-СЕРВЕР ДЛЯ RENDER =====
+
+async def health_check(request):
+    """Health check endpoint для Render"""
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    """Запуск веб-сервера для Render"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    port = int(os.getenv('PORT', 8000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Web server started on port {port}")
+
 async def main():
-    # Удаляем webhook если он был установлен
     await bot.delete_webhook(drop_pending_updates=True)
     print("🚀 Бот запущен и работает!")
-    await dp.start_polling(bot, skip_updates=True)
+    
+    await asyncio.gather(
+        start_web_server(),
+        dp.start_polling(bot, skip_updates=True)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
