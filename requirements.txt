@@ -1,5 +1,6 @@
 aiogram==3.4.1
 httpx==0.27.2
+aiohttp==3.9.1
 reportlab==4.2.2
 pyswisseph==2.10.3.2
 timezonefinder==6.5.2
