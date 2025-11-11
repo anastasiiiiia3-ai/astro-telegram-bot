@@ -522,12 +522,27 @@ async def start_web_server():
     print(f"🌐 Web server started on port {port}")
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Бот запущен и работает!")
+    # Принудительно удаляем webhook
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook удален")
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления webhook: {e}")
     
+    # Проверяем, что бот работает
+    try:
+        me = await bot.get_me()
+        print(f"✅ Бот подключен: @{me.username} (ID: {me.id})")
+    except Exception as e:
+        print(f"❌ Не удалось подключиться к боту: {e}")
+        return
+    
+    print("🚀 Запускаю веб-сервер и polling...")
+    
+    # Запускаем веб-сервер и бота параллельно
     await asyncio.gather(
         start_web_server(),
-        dp.start_polling(bot, skip_updates=True)
+        dp.start_polling(bot, skip_updates=True, allowed_updates=dp.resolve_used_update_types())
     )
 
 if __name__ == "__main__":
