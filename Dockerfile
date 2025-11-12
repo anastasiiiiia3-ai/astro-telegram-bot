@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка системных зависимостей для geopy и других пакетов
+# Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -18,5 +18,8 @@ COPY . .
 # Проверяем наличие шрифта
 RUN ls -la DejaVuSans.ttf || echo "WARNING: Font file not found"
 
-# Запускаем бота (НЕ FastAPI!)
-CMD ["python", "main.py"]
+# Делаем скрипт исполняемым
+RUN chmod +x start.sh || echo "No start.sh found, using direct python"
+
+# Запускаем бота (используем start.sh если есть, иначе прямо python)
+CMD ["sh", "-c", "if [ -f start.sh ]; then ./start.sh; else python main.py; fi"]
